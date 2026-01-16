@@ -1,0 +1,29 @@
+{
+  "id": "wordpress-plugin-sqli-example",
+  "info": {
+    "name": "WordPress Plugin SQL Injection Validation",
+    "author": ["hackpress"],
+    "severity": "high",
+    "description": "Example SQL injection vulnerability validation template",
+    "reference": [],
+    "tags": ["wordpress", "sqli", "plugin", "validation"]
+  },
+  "variables": {
+    "target": "{{target}}",
+    "plugin_path": "/wp-content/plugins/vulnerable-plugin/"
+  },
+  "http": [
+    {
+      "method": "GET",
+      "path": ["{{plugin_path}}endpoint.php?id=1' OR '1'='1"],
+      "matchers": [
+        {
+          "type": "word",
+          "words": ["SQL syntax", "mysql", "database error"],
+          "part": "body",
+          "case_insensitive": true
+        }
+      ]
+    }
+  ]
+}

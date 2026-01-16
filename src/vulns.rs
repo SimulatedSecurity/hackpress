@@ -1,0 +1,249 @@
+use anyhow::{Context, Result};
+use crate::http_client::HttpClient;
+use crate::models::{VulnTemplate, VulnValidationResult, HttpRequest, Matcher};
+use regex::Regex;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+pub struct VulnEngine;
+
+impl VulnEngine {
+    pub fn load_template(path: &str) -> Result<VulnTemplate> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read template: {}", path))?;
+        let template: VulnTemplate = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse template: {}", path))?;
+        Ok(template)
+    }
+
+    pub fn load_templates_from_dir(dir: &str) -> Result<Vec<VulnTemplate>> {
+        let mut templates = vec![];
+        
+        if !Path::new(dir).exists() {
+            anyhow::bail!("Template directory does not exist: {}", dir);
+        }
+
+        let entries = fs::read_dir(dir)
+            .with_context(|| format!("Failed to read directory: {}", dir))?;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                match Self::load_template(path.to_str().unwrap()) {
+                    Ok(template) => templates.push(template),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load template {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+
+        Ok(templates)
+    }
+
+    pub fn execute(template: &VulnTemplate, client: &HttpClient) -> Result<VulnValidationResult> {
+        let mut variables = template.variables.clone();
+        variables.insert("target".to_string(), client.base_url.clone());
+
+        // Execute HTTP requests (validation only, non-destructive)
+        let mut last_response_body = String::new();
+        let mut last_response_status = 0u16;
+        let mut last_response_headers = HashMap::new();
+
+        for request in &template.http {
+            let (body, status, headers) = Self::execute_request(request, client, &variables)?;
+            last_response_body = body;
+            last_response_status = status;
+            last_response_headers = headers;
+
+            // Check request-level matchers
+            if !request.matchers.is_empty() {
+                if !Self::match_response(&request.matchers, &last_response_body, &last_response_headers, last_response_status) {
+                    return Ok(VulnValidationResult {
+                        template_id: template.id.clone(),
+                        name: template.info.name.clone(),
+                        severity: template.info.severity.clone(),
+                        matched: false,
+                        details: Some("Request matchers did not match".to_string()),
+                    });
+                }
+            }
+        }
+
+        // Check template-level matchers
+        let matched = if template.matchers.is_empty() {
+            true // No matchers means success by default
+        } else {
+            Self::match_response(&template.matchers, &last_response_body, &last_response_headers, last_response_status)
+        };
+
+        Ok(VulnValidationResult {
+            template_id: template.id.clone(),
+            name: template.info.name.clone(),
+            severity: template.info.severity.clone(),
+            matched,
+            details: if matched {
+                Some(format!("Status: {}, Response length: {}", last_response_status, last_response_body.len()))
+            } else {
+                Some("Matchers did not match".to_string())
+            },
+        })
+    }
+
+    fn execute_request(
+        request: &HttpRequest,
+        client: &HttpClient,
+        variables: &HashMap<String, String>,
+    ) -> Result<(String, u16, HashMap<String, String>)> {
+        let method = request.method.to_uppercase();
+        let path = if request.path.is_empty() {
+            "".to_string()
+        } else {
+            Self::substitute_variables(&request.path[0], variables)
+        };
+
+        let headers = if request.headers.is_empty() {
+            None
+        } else {
+            let mut header_map = HashMap::new();
+            for (key, value) in &request.headers {
+                header_map.insert(
+                    key.clone(),
+                    Self::substitute_variables(value, variables),
+                );
+            }
+            Some(header_map)
+        };
+
+        let body = request.body.as_ref()
+            .map(|b| Self::substitute_variables(b, variables));
+
+        let response = match method.as_str() {
+            "GET" => client.get(&path, headers)?,
+            "POST" => client.post(&path, headers, body.as_deref())?,
+            "PUT" => client.put(&path, headers, body.as_deref())?,
+            "DELETE" => client.delete(&path, headers)?,
+            _ => anyhow::bail!("Unsupported HTTP method: {}", method),
+        };
+
+        let status = response.status().as_u16();
+        
+        // Extract headers before consuming response
+        let mut headers_map = HashMap::new();
+        for (name, value) in response.headers() {
+            headers_map.insert(
+                name.as_str().to_lowercase(),
+                value.to_str().unwrap_or("").to_string(),
+            );
+        }
+        
+        let body_text = response.text().unwrap_or_default();
+
+        Ok((body_text, status, headers_map))
+    }
+
+    fn substitute_variables(text: &str, variables: &HashMap<String, String>) -> String {
+        let mut result = text.to_string();
+        for (key, value) in variables {
+            let placeholder = format!("{{{{{}}}}}", key);
+            result = result.replace(&placeholder, value);
+        }
+        result
+    }
+
+    fn match_response(
+        matchers: &[Matcher],
+        body: &str,
+        headers: &HashMap<String, String>,
+        status: u16,
+    ) -> bool {
+        for matcher in matchers {
+            let matched = match matcher.matcher_type.as_str() {
+                "status" => {
+                    if matcher.status.is_empty() {
+                        true
+                    } else {
+                        matcher.status.contains(&status)
+                    }
+                }
+                "word" | "words" => {
+                    let part = matcher.part.as_str();
+                    let text: String = match part {
+                        "body" => body.to_string(),
+                        "header" | "headers" => {
+                            headers.values().map(|v| v.as_str()).collect::<Vec<_>>().join(" ")
+                        }
+                        "all" => {
+                            let header_text = headers.values().map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
+                            format!("{} {}", header_text, body)
+                        }
+                        _ => body.to_string(),
+                    };
+
+                    if matcher.words.is_empty() {
+                        true
+                    } else {
+                        let case_insensitive = matcher.case_insensitive;
+                        matcher.words.iter().any(|word| {
+                            if case_insensitive {
+                                text.to_lowercase().contains(&word.to_lowercase())
+                            } else {
+                                text.contains(word)
+                            }
+                        })
+                    }
+                }
+                "regex" => {
+                    let part = matcher.part.as_str();
+                    let text: String = match part {
+                        "body" => body.to_string(),
+                        "header" | "headers" => {
+                            headers.values().map(|v| v.as_str()).collect::<Vec<_>>().join(" ")
+                        }
+                        "all" => {
+                            let header_text = headers.values().map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
+                            format!("{} {}", header_text, body)
+                        }
+                        _ => body.to_string(),
+                    };
+
+                    if matcher.regex.is_empty() {
+                        true
+                    } else {
+                        matcher.regex.iter().any(|pattern| {
+                            if let Ok(re) = Regex::new(pattern) {
+                                re.is_match(&text)
+                            } else {
+                                false
+                            }
+                        })
+                    }
+                }
+                "size" => {
+                    let size = body.len();
+                    if matcher.size.is_empty() {
+                        true
+                    } else {
+                        matcher.size.contains(&size)
+                    }
+                }
+                _ => true,
+            };
+
+            if matcher.negative {
+                if matched {
+                    return false;
+                }
+            } else {
+                if !matched {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+}

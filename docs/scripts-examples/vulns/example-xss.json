@@ -1,0 +1,29 @@
+{
+  "id": "wordpress-plugin-xss-example",
+  "info": {
+    "name": "WordPress Plugin XSS Validation",
+    "author": ["hackpress"],
+    "severity": "medium",
+    "description": "Example XSS vulnerability validation template for WordPress plugin",
+    "reference": [],
+    "tags": ["wordpress", "xss", "plugin", "validation"]
+  },
+  "variables": {
+    "target": "{{target}}",
+    "plugin_path": "/wp-content/plugins/vulnerable-plugin/"
+  },
+  "http": [
+    {
+      "method": "GET",
+      "path": ["{{plugin_path}}vulnerable-endpoint.php?param=<script>alert('XSS')</script>"],
+      "matchers": [
+        {
+          "type": "word",
+          "words": ["<script>alert('XSS')</script>"],
+          "part": "body",
+          "case_insensitive": false
+        }
+      ]
+    }
+  ]
+}
