@@ -3,9 +3,10 @@ use crate::http_client::HttpClient;
 use crate::models::{DetectedPlugin, DetectedTheme, WordPressInfo, WordPressConfig};
 use crate::constants;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 pub struct WordPressDetector;
 
@@ -13,8 +14,12 @@ struct ThemeInfo {
     name: Option<String>,
     version: Option<String>,
     author: Option<String>,
-    text_domain: Option<String>, // Used as slug for SVN lookup
+    text_domain: Option<String>, // Used as slug for wordpress.org lookup
 }
+
+/// In-process caches so the same slug is not fetched repeatedly during a scan.
+static PLUGIN_VERSION_CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
+static THEME_VERSION_CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
 
 impl Default for ThemeInfo {
     fn default() -> Self {
@@ -25,6 +30,23 @@ impl Default for ThemeInfo {
             text_domain: None,
         }
     }
+}
+
+
+fn urlencoding_slug(slug: &str) -> String {
+    // wordpress.org slugs are typically [a-z0-9-]; encode anything else safely
+    let mut out = String::with_capacity(slug.len());
+    for c in slug.chars() {
+        match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => out.push(c),
+            _ => {
+                for b in c.to_string().as_bytes() {
+                    out.push_str(&format!("%{:02X}", b));
+                }
+            }
+        }
+    }
+    out
 }
 
 impl WordPressDetector {
@@ -405,14 +427,13 @@ impl WordPressDetector {
             }
         }
 
-        // If not stealth mode, get latest versions from SVN for plugins with known versions
+        // If not stealth mode, warm wordpress.org version cache for plugins with known versions
         if !stealth {
             for plugin in &mut plugins {
                 if plugin.version != "unknown" {
-                    if let Some(latest_version) = Self::get_latest_plugin_version_from_svn(&plugin.slug, verbose) {
-                        // Store latest version info (could be used for vulnerability checking)
+                    if let Some(latest_version) = Self::get_latest_plugin_version(&plugin.slug, verbose) {
                         if verbose {
-                            eprintln!("     [verbose] Latest SVN version for {}: {}", plugin.slug, latest_version);
+                            eprintln!("     [verbose] Latest wordpress.org version for {}: {}", plugin.slug, latest_version);
                         }
                     }
                 }
@@ -594,146 +615,174 @@ impl WordPressDetector {
         }
         None
     }
-    
-    pub fn get_latest_plugin_version_from_svn(plugin_slug: &str, verbose: bool) -> Option<String> {
-        use crate::constants;
-        // Fetch WordPress plugin SVN listing using slug
-        let url = format!("{}/{}/tags/", constants::WORDPRESS_PLUGINS_SVN_BASE, plugin_slug);
-        
-        if verbose {
-            eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-            eprintln!("     [verbose] [SVN] Checking plugin version for slug: {}", plugin_slug);
-            eprintln!("     [verbose] [SVN] Making request to: {}", url);
+
+    /// Latest plugin version from wordpress.org (cached per process).
+    pub fn get_latest_plugin_version(plugin_slug: &str, verbose: bool) -> Option<String> {
+        Self::cached_wporg_version(
+            plugin_slug,
+            verbose,
+            true,
+            &PLUGIN_VERSION_CACHE,
+        )
+    }
+
+    /// Latest theme version from wordpress.org (cached per process).
+    pub fn get_latest_theme_version(theme_slug: &str, verbose: bool) -> Option<String> {
+        Self::cached_wporg_version(
+            theme_slug,
+            verbose,
+            false,
+            &THEME_VERSION_CACHE,
+        )
+    }
+
+    fn cached_wporg_version(
+        slug: &str,
+        verbose: bool,
+        is_plugin: bool,
+        cache: &Mutex<Option<HashMap<String, Option<String>>>>,
+    ) -> Option<String> {
+        let slug_key = slug.to_string();
+        {
+            let mut guard = cache.lock().ok()?;
+            let map = guard.get_or_insert_with(HashMap::new);
+            if let Some(cached) = map.get(&slug_key) {
+                if verbose {
+                    match cached {
+                        Some(v) => eprintln!(
+                            "     [verbose] [wporg] cache hit slug={} version={}",
+                            slug, v
+                        ),
+                        None => eprintln!(
+                            "     [verbose] [wporg] cache hit slug={} (not on wordpress.org)",
+                            slug
+                        ),
+                    }
+                }
+                return cached.clone();
+            }
         }
-        
-        // Create a client with a valid User-Agent specifically for SVN requests to avoid 403 Forbidden
+
+        let fetched = Self::fetch_wporg_version(slug, verbose, is_plugin);
+        if let Ok(mut guard) = cache.lock() {
+            let map = guard.get_or_insert_with(HashMap::new);
+            map.insert(slug_key, fetched.clone());
+        }
+        fetched
+    }
+
+    fn fetch_wporg_version(slug: &str, verbose: bool, is_plugin: bool) -> Option<String> {
+        let kind = if is_plugin { "plugin" } else { "theme" };
+        let base = if is_plugin {
+            constants::WORDPRESS_PLUGINS_INFO_API
+        } else {
+            constants::WORDPRESS_THEMES_INFO_API
+        };
+        let url = format!("{}&request[slug]={}", base, urlencoding_slug(slug));
+
+        if verbose {
+            eprintln!(
+                "     [verbose] [wporg] Checking {} version for slug={}",
+                kind, slug
+            );
+        }
+
         let client = match reqwest::blocking::Client::builder()
-            .user_agent(constants::SVN_USER_AGENT)
-            .timeout(std::time::Duration::from_secs(constants::DEFAULT_HTTP_TIMEOUT))
-            .build() {
-            Ok(client) => client,
+            .user_agent(format!("hackpress/{}", constants::VERSION))
+            .timeout(std::time::Duration::from_secs(constants::WORDPRESS_API_TIMEOUT))
+            .build()
+        {
+            Ok(c) => c,
             Err(e) => {
                 if verbose {
-                    eprintln!("     [verbose] [SVN] ✗ Failed to create HTTP client: {}", e);
-                    eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
+                    eprintln!("     [verbose] [wporg] Failed to create HTTP client: {}", e);
                 }
                 return None;
             }
         };
-        
-        if let Ok(response) = client.get(&url).send() {
-            let status = response.status();
-            if verbose {
-                eprintln!("     [verbose] SVN response status: {}", status);
-            }
-            
-            if status.is_success() {
-                if let Ok(text) = response.text() {
-                    if verbose {
-                        eprintln!("     [verbose] SVN response received ({} bytes)", text.len());
-                    }
-                    // Parse SVN directory listing for version numbers
-                    // SVN directory listings show directories like "1.0.0/", "1.1.0/", etc.
-                    let version_patterns = vec![
-                        // Pattern 1: href="X.Y.Z/" or href='X.Y.Z/'
-                        r#"href=["']([\d]+\.[\d]+(?:\.[\d]+)?)/["']"#,
-                        // Pattern 2: <a href="X.Y.Z/"> or <a href='X.Y.Z/'>
-                        r#"<a[^>]+href=["']([\d]+\.[\d]+(?:\.[\d]+)?)/["']"#,
-                        // Pattern 3: Directory entry format in SVN listing
-                        r#"([\d]+\.[\d]+(?:\.[\d]+)?)/\s*$"#,  // X.Y.Z/ at end of line
-                    ];
-                    
-                    let mut versions = Vec::new();
-                    
-                    for pattern in version_patterns {
-                        let version_re = Regex::new(pattern).unwrap();
-                        for caps in version_re.captures_iter(&text) {
-                            if let Some(ver_match) = caps.get(1) {
-                                let ver_str = ver_match.as_str().to_string();
-                                // Validate version format: must have at least one dot and max two dots
-                                if ver_str.contains('.') && ver_str.matches('.').count() <= 2 {
-                                    // Make sure it's a valid version number (only digits and dots)
-                                    if ver_str.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                                        // Ensure it starts and ends with a digit
-                                        if ver_str.chars().next().map_or(false, |c| c.is_ascii_digit()) &&
-                                           ver_str.chars().last().map_or(false, |c| c.is_ascii_digit()) {
-                                            versions.push(ver_str);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Remove duplicates
-                    versions.sort();
-                    versions.dedup();
-                    
-                    // Sort versions and return the latest
-                    if !versions.is_empty() {
-                        versions.sort_by(|a, b| {
-                            // Version comparison (X.Y.Z format)
-                            let a_parts: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-                            let b_parts: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
-                            
-                            // Compare each part
-                            for (a_part, b_part) in a_parts.iter().zip(b_parts.iter()) {
-                                match a_part.cmp(b_part) {
-                                    std::cmp::Ordering::Equal => continue,
-                                    other => return other,
-                                }
-                            }
-                            // If all parts compared are equal, longer version is newer
-                            a_parts.len().cmp(&b_parts.len())
-                        });
-                        
-                        let latest = versions.last().cloned();
-                        if verbose {
-                            if let Some(ref latest_ver) = latest {
-                                eprintln!("     [verbose] [SVN] ✓ Latest version found: {}", latest_ver);
-                                eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                            } else {
-                                eprintln!("     [verbose] [SVN] ✗ No latest version determined");
-                                eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                            }
-                        }
-                        return latest;
-                    } else if verbose {
-                        eprintln!("     [verbose] [SVN] ✗ No valid versions found in SVN listing");
-                        eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                    }
-                } else if verbose {
-                    eprintln!("     [verbose] [SVN] ✗ Failed to read SVN response text");
-                    eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
+
+        let response = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                if verbose {
+                    eprintln!("     [verbose] [wporg] Request failed for {}: {}", slug, e);
                 }
-            } else if verbose {
-                eprintln!("     [verbose] [SVN] ✗ Request failed with status: {}", status);
-                eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
+                return None;
             }
-        } else if verbose {
-            eprintln!("     [verbose] [SVN] ✗ Failed to make request to SVN URL");
-            eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
+        };
+
+        let status = response.status();
+        let text = match response.text() {
+            Ok(t) => t,
+            Err(e) => {
+                if verbose {
+                    eprintln!("     [verbose] [wporg] Failed to read body for {}: {}", slug, e);
+                }
+                return None;
+            }
+        };
+
+        if !status.is_success() {
+            if verbose {
+                eprintln!(
+                    "     [verbose] [wporg] HTTP {} for {} slug={}",
+                    status, kind, slug
+                );
+            }
+            return None;
         }
-        
-        None
+
+        match Self::parse_wporg_version_json(&text) {
+            Some(ver) => {
+                if verbose {
+                    eprintln!(
+                        "     [verbose] [wporg] slug={} version={}",
+                        slug, ver
+                    );
+                }
+                Some(ver)
+            }
+            None => {
+                if verbose {
+                    eprintln!(
+                        "     [verbose] [wporg] slug={} not found on wordpress.org",
+                        slug
+                    );
+                }
+                None
+            }
+        }
     }
 
+    /// Extract `version` from a wordpress.org info API JSON body.
+    pub(crate) fn parse_wporg_version_json(body: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        // Error responses are often `false` or `{ "error": "..." }`
+        if value.is_boolean() || value.get("error").is_some() {
+            return None;
+        }
+        value
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
 
     fn get_theme_info(client: &HttpClient, theme_slug: &str) -> Result<ThemeInfo> {
         let path = format!("/wp-content/themes/{}/style.css", theme_slug);
         let response = client.get(&path, None)?;
-        
+
         if !response.status().is_success() {
             return Ok(ThemeInfo::default());
         }
 
         let text = response.text().context("Failed to read style.css")?;
         let mut theme_info = ThemeInfo::default();
-        
+
         // Parse WordPress theme header (first ~20 lines)
         for line in text.lines().take(30) {
             let line_lower = line.to_lowercase();
-            
+
             // Theme Name
             if line_lower.contains("theme name:") {
                 let name_re = Regex::new(r"(?i)^\s*theme\s+name:\s*(.+)$").unwrap();
@@ -743,7 +792,7 @@ impl WordPressDetector {
                     }
                 }
             }
-            
+
             // Version
             if line_lower.contains("version:") && theme_info.version.is_none() {
                 let version_re = Regex::new(r"(?i)^\s*version:\s*([\d.]+)").unwrap();
@@ -753,7 +802,7 @@ impl WordPressDetector {
                     }
                 }
             }
-            
+
             // Author
             if line_lower.contains("author:") {
                 let author_re = Regex::new(r"(?i)^\s*author:\s*(.+)$").unwrap();
@@ -763,8 +812,8 @@ impl WordPressDetector {
                     }
                 }
             }
-            
-            // Text Domain (used as slug for SVN)
+
+            // Text Domain (used as slug for wordpress.org lookup)
             if line_lower.contains("text domain:") {
                 let text_domain_re = Regex::new(r"(?i)^\s*text\s+domain:\s*(.+)$").unwrap();
                 if let Some(caps) = text_domain_re.captures(line) {
@@ -781,7 +830,7 @@ impl WordPressDetector {
     pub fn compare_wordpress_versions(v1: &str, v2: &str) -> i32 {
         let v1_parts: Vec<u32> = v1.split('.').filter_map(|s| s.parse().ok()).collect();
         let v2_parts: Vec<u32> = v2.split('.').filter_map(|s| s.parse().ok()).collect();
-        
+
         for (v1_part, v2_part) in v1_parts.iter().zip(v2_parts.iter()) {
             match v1_part.cmp(v2_part) {
                 std::cmp::Ordering::Less => return -1,
@@ -789,7 +838,7 @@ impl WordPressDetector {
                 std::cmp::Ordering::Equal => continue,
             }
         }
-        
+
         // If all parts compared are equal, compare lengths
         match v1_parts.len().cmp(&v2_parts.len()) {
             std::cmp::Ordering::Less => -1,
@@ -798,130 +847,6 @@ impl WordPressDetector {
         }
     }
 
-    pub fn get_latest_theme_version_from_svn(theme_slug: &str, verbose: bool) -> Option<String> {
-        use crate::constants;
-        // Fetch WordPress theme SVN listing using slug from /themes/<slug>
-        let url = format!("{}/{}/", constants::WORDPRESS_THEMES_SVN_BASE, theme_slug);
-        
-        if verbose {
-            eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-            eprintln!("     [verbose] [SVN] Checking theme version for slug: {}", theme_slug);
-            eprintln!("     [verbose] [SVN] Making request to: {}", url);
-        }
-        
-        // Create a client with a valid User-Agent specifically for SVN requests to avoid 403 Forbidden
-        let client = match reqwest::blocking::Client::builder()
-            .user_agent(constants::SVN_USER_AGENT)
-            .timeout(std::time::Duration::from_secs(constants::DEFAULT_HTTP_TIMEOUT))
-            .build() {
-            Ok(client) => client,
-            Err(e) => {
-                if verbose {
-                    eprintln!("     [verbose] [SVN] ✗ Failed to create HTTP client: {}", e);
-                    eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                }
-                return None;
-            }
-        };
-        
-        if let Ok(response) = client.get(&url).send() {
-            let status = response.status();
-            if verbose {
-                eprintln!("     [verbose] SVN response status: {}", status);
-            }
-            
-            if status.is_success() {
-                if let Ok(text) = response.text() {
-                    if verbose {
-                        eprintln!("     [verbose] SVN response received ({} bytes)", text.len());
-                    }
-                    // Parse SVN directory listing for version numbers
-                    // SVN directory listings show directories like "1.0.0/", "1.1.0/", etc.
-                    // Look for directory entries that match version format X.Y or X.Y.Z
-                    let version_patterns = vec![
-                        // Pattern 1: href="X.Y.Z/" or href='X.Y.Z/'
-                        r#"href=["']([\d]+\.[\d]+(?:\.[\d]+)?)/["']"#,
-                        // Pattern 2: <a href="X.Y.Z/"> or <a href='X.Y.Z/'>
-                        r#"<a[^>]+href=["']([\d]+\.[\d]+(?:\.[\d]+)?)/["']"#,
-                        // Pattern 3: Directory entry format in SVN listing
-                        r#"([\d]+\.[\d]+(?:\.[\d]+)?)/\s*$"#,  // X.Y.Z/ at end of line
-                    ];
-                    
-                    let mut versions = Vec::new();
-                    
-                    for pattern in version_patterns {
-                        let version_re = Regex::new(pattern).unwrap();
-                        for caps in version_re.captures_iter(&text) {
-                            if let Some(ver_match) = caps.get(1) {
-                                let ver_str = ver_match.as_str().to_string();
-                                // Validate version format: must have at least one dot and max two dots
-                                if ver_str.contains('.') && ver_str.matches('.').count() <= 2 {
-                                    // Make sure it's a valid version number (only digits and dots)
-                                    if ver_str.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                                        // Ensure it starts and ends with a digit
-                                        if ver_str.chars().next().map_or(false, |c| c.is_ascii_digit()) &&
-                                           ver_str.chars().last().map_or(false, |c| c.is_ascii_digit()) {
-                                            versions.push(ver_str);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Remove duplicates
-                    versions.sort();
-                    versions.dedup();
-                    
-                    // Sort versions and return the latest
-                    if !versions.is_empty() {
-                        versions.sort_by(|a, b| {
-                            // Version comparison (X.Y.Z format)
-                            let a_parts: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-                            let b_parts: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
-                            
-                            // Compare each part
-                            for (a_part, b_part) in a_parts.iter().zip(b_parts.iter()) {
-                                match a_part.cmp(b_part) {
-                                    std::cmp::Ordering::Equal => continue,
-                                    other => return other,
-                                }
-                            }
-                            // If all parts compared are equal, longer version is newer
-                            a_parts.len().cmp(&b_parts.len())
-                        });
-                        
-                        let latest = versions.last().cloned();
-                        if verbose {
-                            if let Some(ref latest_ver) = latest {
-                                eprintln!("     [verbose] [SVN] ✓ Latest version found: {}", latest_ver);
-                                eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                            } else {
-                                eprintln!("     [verbose] [SVN] ✗ No latest version determined");
-                                eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                            }
-                        }
-                        return latest;
-                    } else if verbose {
-                        eprintln!("     [verbose] [SVN] ✗ No valid versions found in SVN listing");
-                        eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                    }
-                } else if verbose {
-                    eprintln!("     [verbose] [SVN] ✗ Failed to read SVN response text");
-                    eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-                }
-            } else if verbose {
-                eprintln!("     [verbose] [SVN] ✗ Request failed with status: {}", status);
-                eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-            }
-        } else if verbose {
-            eprintln!("     [verbose] [SVN] ✗ Failed to make request to SVN URL");
-            eprintln!("     [verbose] ════════════════════════════════════════════════════════════");
-        }
-        
-        None
-    }
-    
     pub fn check_wordpress_config(client: &HttpClient, verbose: bool, use_realtime_output: bool) -> Result<(Option<WordPressConfig>, bool)> {
         let mut xmlrpc_enabled = false;
         let mut comments_allowed = false;
@@ -1361,11 +1286,11 @@ impl WordPressDetector {
                         crate::output::OutputFormatter::print_plugin_item_real_time(&plugin, false, verbose);
                     }
 
-                    // Get latest version from SVN if version is known
+                    // Warm wordpress.org version cache if version is known
                     if plugin.version != "unknown" {
-                        if let Some(latest_version) = Self::get_latest_plugin_version_from_svn(slug, verbose) {
+                        if let Some(latest_version) = Self::get_latest_plugin_version(slug, verbose) {
                             if verbose {
-                                eprintln!("     [verbose] Latest SVN version for {}: {}", slug, latest_version);
+                                eprintln!("     [verbose] Latest wordpress.org version for {}: {}", slug, latest_version);
                             }
                         }
                     }
@@ -1449,11 +1374,11 @@ impl WordPressDetector {
                         crate::output::OutputFormatter::print_theme_item_real_time(&theme, false, verbose);
                     }
 
-                    // Get latest version from SVN if version is known
+                    // Warm wordpress.org version cache if version is known
                     if theme.version != "unknown" {
-                        if let Some(latest_version) = Self::get_latest_theme_version_from_svn(slug, verbose) {
+                        if let Some(latest_version) = Self::get_latest_theme_version(slug, verbose) {
                             if verbose {
-                                eprintln!("     [verbose] Latest SVN version for {}: {}", slug, latest_version);
+                                eprintln!("     [verbose] Latest wordpress.org version for {}: {}", slug, latest_version);
                             }
                         }
                     }
@@ -1466,5 +1391,82 @@ impl WordPressDetector {
         }
 
         Ok(themes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn parse_wporg_version_json_ok() {
+        let body = r#"{"name":"Elementor","slug":"elementor","version":"3.26.0","requires":"6.0"}"#;
+        assert_eq!(
+            WordPressDetector::parse_wporg_version_json(body).as_deref(),
+            Some("3.26.0")
+        );
+    }
+
+    #[test]
+    fn parse_wporg_version_json_error_object() {
+        let body = r#"{"error":"Plugin not found."}"#;
+        assert_eq!(WordPressDetector::parse_wporg_version_json(body), None);
+    }
+
+    #[test]
+    fn parse_wporg_version_json_false() {
+        assert_eq!(WordPressDetector::parse_wporg_version_json("false"), None);
+    }
+
+    #[test]
+    fn parse_wporg_version_json_empty_version() {
+        assert_eq!(
+            WordPressDetector::parse_wporg_version_json(r#"{"version":""}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_wporg_version_json_invalid() {
+        assert_eq!(WordPressDetector::parse_wporg_version_json("not-json"), None);
+    }
+
+    #[test]
+    fn wporg_cache_hit_returns_injected_value() {
+        {
+            let mut guard = PLUGIN_VERSION_CACHE.lock().unwrap();
+            let map = guard.get_or_insert_with(HashMap::new);
+            map.insert(
+                "cache-test-slug".to_string(),
+                Some("9.9.9".to_string()),
+            );
+            map.insert("cache-test-missing".to_string(), None);
+        }
+
+        assert_eq!(
+            WordPressDetector::get_latest_plugin_version("cache-test-slug", false).as_deref(),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            WordPressDetector::get_latest_plugin_version("cache-test-missing", false),
+            None
+        );
+
+        // Second lookup must keep the same cached result
+        assert_eq!(
+            WordPressDetector::get_latest_plugin_version("cache-test-slug", false).as_deref(),
+            Some("9.9.9")
+        );
+    }
+
+    #[test]
+    fn compare_wordpress_versions_basic() {
+        assert!(WordPressDetector::compare_wordpress_versions("3.25.0", "3.26.0") < 0);
+        assert!(WordPressDetector::compare_wordpress_versions("3.26.0", "3.25.0") > 0);
+        assert_eq!(
+            WordPressDetector::compare_wordpress_versions("3.26.0", "3.26.0"),
+            0
+        );
     }
 }

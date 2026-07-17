@@ -224,7 +224,7 @@ pub struct DetectedTheme {
     #[serde(default)]
     pub author: Option<String>,
     #[serde(default)]
-    pub text_domain: Option<String>, // Used for SVN lookup
+    pub text_domain: Option<String>, // Used as slug for wordpress.org lookup
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

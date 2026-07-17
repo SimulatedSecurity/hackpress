@@ -174,14 +174,14 @@ impl OutputFormatter {
     pub fn print_plugin_item(plugin: &DetectedPlugin, verbose: bool) {
         let mut plugin_line = format!("  - {} (v{})", plugin.name.bright_cyan(), plugin.version);
         
-        // Check against latest WordPress plugin version from SVN
+        // Check against latest WordPress plugin version from wordpress.org
         if plugin.version != "unknown" {
             if verbose {
                 eprintln!("     [verbose] Checking plugin version for slug: {}", plugin.slug);
             }
-            if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_plugin_version_from_svn(&plugin.slug, verbose) {
+            if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_plugin_version(&plugin.slug, verbose) {
                 if verbose {
-                    eprintln!("     [verbose] Comparing detected version {} with latest SVN version {}", plugin.version, latest_version);
+                    eprintln!("     [verbose] Comparing detected version {} with latest wordpress.org version {}", plugin.version, latest_version);
                 }
                 let comparison = crate::detection::WordPressDetector::compare_wordpress_versions(&plugin.version, &latest_version);
                 if verbose {
@@ -193,7 +193,7 @@ impl OutputFormatter {
                     plugin_line.push_str(&format!(" - {}", "UP TO DATE".bright_green()));
                 }
             } else if verbose {
-                eprintln!("     [verbose] Could not retrieve latest version from SVN for plugin slug: {}", plugin.slug);
+                eprintln!("     [verbose] Could not retrieve latest version from wordpress.org for plugin slug: {}", plugin.slug);
             }
         }
         println!("{}", plugin_line);
@@ -220,15 +220,14 @@ impl OutputFormatter {
         if let Some(ref author) = theme.author {
             theme_line.push_str(&format!(" by {}", author.bright_blue()));
         }
-        // Check against latest WordPress theme version from SVN (using slug from /themes/<slug>)
+        // Check against latest WordPress theme version from wordpress.org
         if theme.version != "unknown" {
-            // Use the slug directly from /themes/<slug> path
             if verbose {
                 eprintln!("     [verbose] Checking theme version for slug: {}", theme.slug);
             }
-            if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_theme_version_from_svn(&theme.slug, verbose) {
+            if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_theme_version(&theme.slug, verbose) {
                 if verbose {
-                    eprintln!("     [verbose] Comparing detected version {} with latest SVN version {}", theme.version, latest_version);
+                    eprintln!("     [verbose] Comparing detected version {} with latest wordpress.org version {}", theme.version, latest_version);
                 }
                 let comparison = crate::detection::WordPressDetector::compare_wordpress_versions(&theme.version, &latest_version);
                 if verbose {
@@ -240,44 +239,162 @@ impl OutputFormatter {
                     theme_line.push_str(&format!(" - {}", "UP TO DATE".bright_green()));
                 }
             } else if verbose {
-                eprintln!("     [verbose] Could not retrieve latest version from SVN for theme slug: {}", theme.slug);
+                eprintln!("     [verbose] Could not retrieve latest version from wordpress.org for theme slug: {}", theme.slug);
             }
         }
         println!("{}", theme_line);
     }
 
-    pub fn print_vulnerability_item(vuln: &FoundVulnerability, index: usize) {
-        let severity_color = match vuln.severity.as_str() {
-            "critical" => vuln.severity.bright_red().bold(),
-            "high" => vuln.severity.bright_red(),
-            "medium" => vuln.severity.bright_yellow(),
-            "low" => vuln.severity.bright_blue(),
-            _ => vuln.severity.white(),
-        };
-        
-        // Format: 1. <slug> [severity]
-        let component_display = if vuln.affected_component == "wordpress-core" {
-            "wordpress-core"
-        } else {
-            &vuln.affected_component
-        };
-        println!("  {}. {} [{}]", index + 1, component_display.bright_cyan(), severity_color);
-        
-        // Indented details
-        println!("    - description: {}", vuln.description);
-        if !vuln.affected_versions.is_empty() {
-            println!("    - affected versions: {}", vuln.affected_versions.join(", "));
+    pub fn print_vulnerabilities_section_header() {
+        println!("{}", "Vulnerabilities".bright_white().bold());
+    }
+
+    /// Print all vulnerabilities as a cvemap-style CLI table.
+    pub fn print_vulnerabilities_table(vulns: &[FoundVulnerability]) {
+        if vulns.is_empty() {
+            return;
         }
-        if !vuln.references.is_empty() {
-            println!("    - references:");
-            for ref_url in &vuln.references {
-                println!("      {}", ref_url.bright_blue().underline());
-            }
+        Self::print_vulnerabilities_section_header();
+        println!();
+        print!("{}", Self::format_vulnerabilities_table(vulns, true));
+        println!();
+    }
+
+    fn severity_colored(severity: &str) -> ColoredString {
+        match severity.to_lowercase().as_str() {
+            "critical" => severity.bright_red().bold(),
+            "high" => severity.bright_red(),
+            "medium" => severity.bright_yellow(),
+            "low" => severity.bright_blue(),
+            _ => severity.normal(),
         }
     }
 
-    pub fn print_vulnerabilities_section_header() {
-        println!("{}", "Vulnerabilities".bright_white().bold());
+    fn truncate_str(s: &str, max: usize) -> String {
+        let count = s.chars().count();
+        if count <= max {
+            s.to_string()
+        } else if max <= 1 {
+            "…".to_string()
+        } else {
+            format!("{}…", s.chars().take(max - 1).collect::<String>())
+        }
+    }
+
+    fn pad_visible(s: &str, width: usize) -> String {
+        let len = s.chars().count();
+        if len >= width {
+            s.to_string()
+        } else {
+            format!("{}{}", s, " ".repeat(width - len))
+        }
+    }
+
+    /// Build a fixed-width vulnerability table (optionally with ANSI colors).
+    pub fn format_vulnerabilities_table(vulns: &[FoundVulnerability], colored: bool) -> String {
+        // Column widths tuned for wide terminals (~140+)
+        const W_NUM: usize = 3;
+        const W_SEV: usize = 8;
+        const W_TYPE: usize = 6;
+        const W_COMP: usize = 16;
+        const W_VER: usize = 9;
+        const W_AFF: usize = 12;
+        const W_DESC: usize = 32;
+        const W_REF: usize = 42;
+
+        let mut out = String::new();
+
+        let hdr = format!(
+            " {}  {}  {}  {}  {}  {}  {}  {}",
+            Self::pad_visible("#", W_NUM),
+            Self::pad_visible("SEVERITY", W_SEV),
+            Self::pad_visible("TYPE", W_TYPE),
+            Self::pad_visible("COMPONENT", W_COMP),
+            Self::pad_visible("VERSION", W_VER),
+            Self::pad_visible("AFFECTED", W_AFF),
+            Self::pad_visible("DESCRIPTION", W_DESC),
+            Self::pad_visible("REFERENCE", W_REF),
+        );
+        if colored {
+            out.push_str(&format!("{}\n", hdr.bright_white().bold()));
+            out.push_str(&format!("{}\n", "─".repeat(hdr.chars().count()).bright_black()));
+        } else {
+            out.push_str(&format!("{}\n", hdr));
+            out.push_str(&format!("{}\n", "-".repeat(hdr.len())));
+        }
+
+        for (idx, vuln) in vulns.iter().enumerate() {
+            let num = format!("{}", idx + 1);
+            let sev = Self::truncate_str(&vuln.severity, W_SEV);
+            let vtype = Self::truncate_str(&vuln.vuln_type, W_TYPE);
+            let comp = Self::truncate_str(&vuln.affected_component, W_COMP);
+            let ver = Self::truncate_str(&vuln.component_version, W_VER);
+            let aff = Self::truncate_str(&vuln.affected_versions.join(", "), W_AFF);
+            let desc = Self::truncate_str(&vuln.description, W_DESC);
+            let reference = vuln
+                .references
+                .first()
+                .map(|u| Self::truncate_str(u, W_REF))
+                .unwrap_or_default();
+
+            if colored {
+                let sev_c = Self::severity_colored(&sev);
+                out.push_str(&format!(
+                    " {}  {}  {}  {}  {}  {}  {}  {}\n",
+                    Self::pad_visible(&num, W_NUM).bright_black(),
+                    format!("{}{}", sev_c, " ".repeat(W_SEV.saturating_sub(sev.chars().count()))),
+                    Self::pad_visible(&vtype, W_TYPE).bright_magenta(),
+                    Self::pad_visible(&comp, W_COMP).bright_cyan(),
+                    Self::pad_visible(&ver, W_VER),
+                    Self::pad_visible(&aff, W_AFF).bright_yellow(),
+                    Self::pad_visible(&desc, W_DESC),
+                    reference.bright_blue().underline(),
+                ));
+            } else {
+                out.push_str(&format!(
+                    " {}  {}  {}  {}  {}  {}  {}  {}\n",
+                    Self::pad_visible(&num, W_NUM),
+                    Self::pad_visible(&sev, W_SEV),
+                    Self::pad_visible(&vtype, W_TYPE),
+                    Self::pad_visible(&comp, W_COMP),
+                    Self::pad_visible(&ver, W_VER),
+                    Self::pad_visible(&aff, W_AFF),
+                    Self::pad_visible(&desc, W_DESC),
+                    reference,
+                ));
+            }
+        }
+
+        out.push_str(&format!("\n  {} finding(s)\n", vulns.len()));
+        out
+    }
+
+    fn format_vulnerabilities_markdown(vulns: &[FoundVulnerability]) -> String {
+        let mut out = String::from("## Vulnerabilities\n\n");
+        out.push_str("| # | Severity | Type | Component | Version | Affected | Description | Reference |\n");
+        out.push_str("|---|----------|------|-----------|---------|----------|-------------|----------|\n");
+        for (idx, vuln) in vulns.iter().enumerate() {
+            let desc = vuln.description.replace('|', "\\|");
+            let aff = vuln.affected_versions.join(", ").replace('|', "\\|");
+            let reference = vuln
+                .references
+                .first()
+                .map(|u| format!("[{}]({})", u, u))
+                .unwrap_or_else(|| "—".to_string());
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                idx + 1,
+                vuln.severity,
+                vuln.vuln_type,
+                vuln.affected_component,
+                vuln.component_version,
+                aff,
+                desc,
+                reference
+            ));
+        }
+        out.push('\n');
+        out
     }
 
     pub fn print_usernames_section_header() {
@@ -315,15 +432,6 @@ impl OutputFormatter {
             Self::print_themes_section_header();
         }
         Self::print_theme_item(theme, verbose);
-    }
-
-    // Helper method to print vulnerability item - header is printed by caller when first vuln is found
-    pub fn print_vulnerability_item_real_time(vuln: &FoundVulnerability, index: usize, is_first: bool) {
-        if is_first {
-            Self::print_vulnerabilities_section_header();
-            println!();
-        }
-        Self::print_vulnerability_item(vuln, index);
     }
 
     // Helper method to print username item - header is printed by caller when first username is found
@@ -487,9 +595,9 @@ impl OutputFormatter {
             output.push_str(&format!("{}\n", "Plugins".bright_white().bold()));
             for plugin in &results.plugins {
                 let mut plugin_line = format!("  - {} (v{})", plugin.name.bright_cyan(), plugin.version);
-                // Check against latest WordPress plugin version from SVN
+                // Check against latest WordPress plugin version from wordpress.org
                 if plugin.version != "unknown" {
-                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_plugin_version_from_svn(&plugin.slug, verbose) {
+                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_plugin_version(&plugin.slug, verbose) {
                         let comparison = crate::detection::WordPressDetector::compare_wordpress_versions(&plugin.version, &latest_version);
                         if comparison < 0 {
                             plugin_line.push_str(&format!(" - {} (Latest: {})", "OUTDATED".bright_red().bold(), latest_version.bright_green()));
@@ -517,10 +625,9 @@ impl OutputFormatter {
                 if let Some(ref author) = theme.author {
                     theme_line.push_str(&format!(" by {}", author.bright_blue()));
                 }
-                // Check against latest WordPress theme version from SVN (using slug from /themes/<slug>)
+                // Check against latest WordPress theme version from wordpress.org
                 if theme.version != "unknown" {
-                    // Use the slug directly from /themes/<slug> path
-                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_theme_version_from_svn(&theme.slug, verbose) {
+                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_theme_version(&theme.slug, verbose) {
                         if crate::detection::WordPressDetector::compare_wordpress_versions(&theme.version, &latest_version) < 0 {
                             theme_line.push_str(&format!(" - {} (Latest: {})", "OUTDATED".bright_red().bold(), latest_version.bright_green()));
                         } else {
@@ -535,35 +642,8 @@ impl OutputFormatter {
 
         // Vulnerabilities
         if !results.vulnerabilities.is_empty() {
-            output.push_str(&format!("{}\n", "Vulnerabilities".bright_white().bold()));
-            for (idx, vuln) in results.vulnerabilities.iter().enumerate() {
-                let severity_color = match vuln.severity.as_str() {
-                    "critical" => vuln.severity.bright_red().bold(),
-                    "high" => vuln.severity.bright_red(),
-                    "medium" => vuln.severity.bright_yellow(),
-                    "low" => vuln.severity.bright_blue(),
-                    _ => vuln.severity.white(),
-                };
-                
-                let component_display = if vuln.affected_component == "wordpress-core" {
-                    "wordpress-core"
-                } else {
-                    &vuln.affected_component
-                };
-                output.push_str(&format!("  {}. {} [{}]\n", idx + 1, component_display.bright_cyan(), severity_color));
-                
-                // Indented details
-                output.push_str(&format!("    - description: {}\n", vuln.description));
-                if !vuln.affected_versions.is_empty() {
-                    output.push_str(&format!("    - affected versions: {}\n", vuln.affected_versions.join(", ")));
-                }
-                if !vuln.references.is_empty() {
-                    output.push_str("    - references:\n");
-                    for ref_url in &vuln.references {
-                        output.push_str(&format!("      {}\n", ref_url.bright_blue().underline()));
-                    }
-                }
-            }
+            output.push_str(&format!("{}\n\n", "Vulnerabilities".bright_white().bold()));
+            output.push_str(&Self::format_vulnerabilities_table(&results.vulnerabilities, true));
             output.push('\n');
         }
 
@@ -731,9 +811,9 @@ impl OutputFormatter {
             output.push_str(&format!("## Plugins\n\n"));
             for plugin in &results.plugins {
                 let mut plugin_line = format!("- **{}** (v{})", plugin.name, plugin.version);
-                // Check against latest WordPress plugin version from SVN
+                // Check against latest WordPress plugin version from wordpress.org
                 if plugin.version != "unknown" {
-                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_plugin_version_from_svn(&plugin.slug, verbose) {
+                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_plugin_version(&plugin.slug, verbose) {
                         if crate::detection::WordPressDetector::compare_wordpress_versions(&plugin.version, &latest_version) < 0 {
                             plugin_line.push_str(&format!(" - ⚠️ OUTDATED (Latest: {})", latest_version));
                         } else {
@@ -760,10 +840,9 @@ impl OutputFormatter {
                 if let Some(ref author) = theme.author {
                     theme_line.push_str(&format!(" by {}", author));
                 }
-                // Check against latest WordPress theme version from SVN (using slug from /themes/<slug>)
+                // Check against latest WordPress theme version from wordpress.org
                 if theme.version != "unknown" {
-                    // Use the slug directly from /themes/<slug> path
-                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_theme_version_from_svn(&theme.slug, verbose) {
+                    if let Some(latest_version) = crate::detection::WordPressDetector::get_latest_theme_version(&theme.slug, verbose) {
                         if crate::detection::WordPressDetector::compare_wordpress_versions(&theme.version, &latest_version) < 0 {
                             theme_line.push_str(&format!(" - ⚠️ OUTDATED (Latest: {})", latest_version));
                         } else {
@@ -778,28 +857,7 @@ impl OutputFormatter {
 
         // Vulnerabilities
         if !results.vulnerabilities.is_empty() {
-            output.push_str(&format!("## Vulnerabilities\n\n"));
-            for (idx, vuln) in results.vulnerabilities.iter().enumerate() {
-                let component_display = if vuln.affected_component == "wordpress-core" {
-                    "wordpress-core"
-                } else {
-                    &vuln.affected_component
-                };
-                output.push_str(&format!("{}. **{}** [{}]\n\n", idx + 1, component_display, vuln.severity));
-                
-                // Indented details
-                output.push_str(&format!("   - **description:** {}\n", vuln.description));
-                if !vuln.affected_versions.is_empty() {
-                    output.push_str(&format!("   - **affected versions:** {}\n", vuln.affected_versions.join(", ")));
-                }
-                if !vuln.references.is_empty() {
-                    output.push_str("   - **references:**\n");
-                    for ref_url in &vuln.references {
-                        output.push_str(&format!("     - [{}]({})\n", ref_url, ref_url));
-                    }
-                }
-                output.push('\n');
-            }
+            output.push_str(&Self::format_vulnerabilities_markdown(&results.vulnerabilities));
         }
 
         // Usernames
@@ -823,3 +881,58 @@ impl OutputFormatter {
         output
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_vulns() -> Vec<FoundVulnerability> {
+        vec![
+            FoundVulnerability {
+                id: "el-pro-xss".into(),
+                severity: "high".into(),
+                description: "Reflected Cross Site Scripting (XSS) vulnerability".into(),
+                affected_component: "elementor-pro".into(),
+                component_version: "3.20.1".into(),
+                affected_versions: vec!["<3.21.3".into()],
+                references: vec!["https://patchstack.com/example-1".into()],
+                vuln_type: "plugin".into(),
+            },
+            FoundVulnerability {
+                id: "el-dom".into(),
+                severity: "medium".into(),
+                description: "Authenticated (Contributor+) Stored DOM-Based Cross-Site Scripting via Text Path vulnerability".into(),
+                affected_component: "elementor".into(),
+                component_version: "3.26.0".into(),
+                affected_versions: vec!["<3.33.4".into()],
+                references: vec!["https://patchstack.com/example-2".into()],
+                vuln_type: "plugin".into(),
+            },
+            FoundVulnerability {
+                id: "core".into(),
+                severity: "critical".into(),
+                description: "Remote code execution in WordPress core".into(),
+                affected_component: "wordpress-core".into(),
+                component_version: "6.4.2".into(),
+                affected_versions: vec!["<=6.4.2".into()],
+                references: vec![],
+                vuln_type: "core".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn vulnerabilities_table_has_header_and_rows() {
+        let table = OutputFormatter::format_vulnerabilities_table(&sample_vulns(), false);
+        println!("\n{}", table);
+        assert!(table.contains("SEVERITY"));
+        assert!(table.contains("COMPONENT"));
+        assert!(table.contains("REFERENCE"));
+        assert!(table.contains("elementor-pro"));
+        assert!(table.contains("high"));
+        assert!(table.contains("3 finding(s)"));
+        assert!(table.contains("https://patchstack.com/example-1"));
+        assert!(!table.contains("References\n"));
+    }
+}
+

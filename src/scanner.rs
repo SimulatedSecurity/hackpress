@@ -183,11 +183,9 @@ impl Scanner {
             vec![]
         };
         
-        // Display vulnerabilities as found (real-time output)
+        // Display vulnerabilities as a table (real-time output)
         if use_realtime_output {
-            for (idx, vuln) in vulnerabilities.iter().enumerate() {
-                OutputFormatter::print_vulnerability_item_real_time(vuln, idx, idx == 0);
-            }
+            OutputFormatter::print_vulnerabilities_table(&vulnerabilities);
             if !vulnerabilities.is_empty() {
                 OutputFormatter::print_section_end();
             }
