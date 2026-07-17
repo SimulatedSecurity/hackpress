@@ -38,6 +38,9 @@ impl HttpClient {
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(10))
             .cookie_store(true)
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
             // Use native TLS for better fingerprint matching
             .tls_built_in_root_certs(true);
 
@@ -53,6 +56,10 @@ impl HttpClient {
             last_referer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    pub fn waf_bypass_enabled(&self) -> bool {
+        self.waf_bypass
     }
     
     #[allow(dead_code)]
@@ -188,6 +195,80 @@ impl HttpClient {
         }
         
         Ok(response)
+    }
+
+    /// Generic request with optional per-request redirect limit and cookie jar usage.
+    /// When `max_redirects` is set or `cookie_reuse` is false, uses an ephemeral client
+    /// (does not share the session cookie jar with the main client).
+    pub fn request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: Option<HashMap<String, String>>,
+        body: Option<&str>,
+        max_redirects: Option<u32>,
+        cookie_reuse: bool,
+    ) -> Result<Response> {
+        let needs_ephemeral = max_redirects.is_some() || !cookie_reuse;
+        if !needs_ephemeral {
+            return match method.to_uppercase().as_str() {
+                "GET" => self.get(path, headers),
+                "POST" => self.post(path, headers, body),
+                "PUT" => self.put(path, headers, body),
+                "DELETE" => self.delete(path, headers),
+                other => anyhow::bail!("Unsupported HTTP method: {}", other),
+            };
+        }
+
+        let url = self.build_url(path)?;
+        let redirects = max_redirects.unwrap_or(10) as usize;
+        let ephemeral = ClientBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(redirects))
+            .cookie_store(cookie_reuse)
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
+            .tls_built_in_root_certs(true)
+            .build()
+            .context("Failed to create ephemeral HTTP client")?;
+
+        let mut request = match method.to_uppercase().as_str() {
+            "GET" => ephemeral.get(&url),
+            "POST" => ephemeral.post(&url),
+            "PUT" => ephemeral.put(&url),
+            "DELETE" => ephemeral.delete(&url),
+            other => anyhow::bail!("Unsupported HTTP method: {}", other),
+        };
+        request = self.add_headers(request, headers, &method.to_uppercase(), &url)?;
+        if let Some(body) = body {
+            request = request.body(body.to_string());
+        }
+
+        let start_time = Instant::now();
+        let response = request
+            .send()
+            .context("Failed to send HTTP request")?;
+        self.check_response_time(&url, start_time.elapsed());
+        Ok(response)
+    }
+
+    /// Send a raw HTTP request blob (request-line + headers + optional body).
+    pub fn raw_request(
+        &self,
+        raw: &str,
+        max_redirects: Option<u32>,
+        cookie_reuse: bool,
+    ) -> Result<Response> {
+        let parsed = parse_raw_http(raw).context("Failed to parse raw HTTP request")?;
+        self.request(
+            &parsed.method,
+            &parsed.path,
+            Some(parsed.headers),
+            parsed.body.as_deref(),
+            max_redirects,
+            cookie_reuse,
+        )
     }
     
     fn build_url(&self, path: &str) -> Result<String> {
@@ -330,6 +411,80 @@ impl HttpClient {
         Ok(json)
     }
 
+}
+
+struct ParsedRawHttp {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Option<String>,
+}
+
+fn parse_raw_http(raw: &str) -> Result<ParsedRawHttp> {
+    let normalized = raw.replace("\r\n", "\n");
+    let (head, body) = match normalized.split_once("\n\n") {
+        Some((h, b)) => (h, Some(b.to_string())),
+        None => (normalized.as_str(), None),
+    };
+
+    let mut lines = head.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Empty raw HTTP request"))?
+        .trim();
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Missing method in raw request"))?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Missing path in raw request"))?
+        .to_string();
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_string(), value.trim().to_string());
+        }
+    }
+
+    // Host is resolved via base_url join; drop explicit Host to avoid conflicts
+    headers.remove("Host");
+    headers.remove("host");
+
+    Ok(ParsedRawHttp {
+        method,
+        path,
+        headers,
+        body: body.filter(|b| !b.is_empty()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_raw_http_basic() {
+        let raw = "POST /wp-login.php HTTP/1.1\nContent-Type: application/x-www-form-urlencoded\nHost: example.com\n\nlog=admin&pwd=test";
+        let parsed = parse_raw_http(raw).unwrap();
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/wp-login.php");
+        assert_eq!(
+            parsed.headers.get("Content-Type").map(String::as_str),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert!(!parsed.headers.contains_key("Host"));
+        assert_eq!(parsed.body.as_deref(), Some("log=admin&pwd=test"));
+    }
+}
+
+impl HttpClient {
     fn check_response_time(&self, url: &str, elapsed: Duration) {
         let seconds = elapsed.as_secs_f64();
         

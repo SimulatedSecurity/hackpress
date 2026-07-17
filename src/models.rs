@@ -76,12 +76,17 @@ pub struct HttpRequest {
     pub raw: Vec<String>,
     #[serde(default)]
     pub max_redirects: Option<u32>,
-    #[serde(default)]
+    /// Reuse cookies from the session client (default: true).
+    #[serde(default = "default_true")]
     pub cookie_reuse: bool,
     #[serde(default)]
     pub matchers: Vec<Matcher>,
     #[serde(default)]
     pub extractors: Vec<Extractor>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +113,9 @@ pub struct Matcher {
 pub struct Extractor {
     #[serde(rename = "type")]
     pub extractor_type: String, // regex, json, xpath, etc.
+    /// Variable name to store the extracted value (usable as {{name}} later)
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub part: String,
     #[serde(default)]
@@ -136,6 +144,27 @@ pub struct ScanResults {
     pub usernames: Vec<EnumeratedUsername>,
     pub file_disclosures: Vec<FileDisclosure>,
     pub bruteforce_results: Option<BruteforceResults>,
+}
+
+impl ScanResults {
+    /// Empty results shell for single-purpose commands (exploit, vuln, bruteforce, …).
+    pub fn for_target(target: String) -> Self {
+        Self {
+            target,
+            tech_stack: None,
+            robots_txt: None,
+            wordpress: None,
+            wordpress_config: None,
+            plugins: vec![],
+            themes: vec![],
+            vulnerabilities: vec![],
+            vuln_validations: vec![],
+            exploit_results: vec![],
+            usernames: vec![],
+            file_disclosures: vec![],
+            bruteforce_results: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1084,23 +1084,27 @@ impl WordPressDetector {
             indicators >= 3
         }
         
-        // Track WAF blocking responses (403/406/415) for WAF detection
+        // Track confirmed WAF blocks while probing login paths (not every 403)
         let mut waf_block_count = 0;
         let mut total_checked = 0;
+
+        let record_waf = |status: u16, headers: &std::collections::HashMap<String, String>, body: &str| -> bool {
+            crate::error_detection::ErrorDetector::detect_waf(status, headers, body)
+                .map(|e| crate::error_detection::ErrorDetector::is_waf_block(&e))
+                .unwrap_or(false)
+        };
         
         // First check standard path
         if let Ok(response) = client.get(&standard_path, None) {
             let status = response.status().as_u16();
+            let headers = Self::extract_response_headers(&response);
             total_checked += 1;
-            
-            // Track WAF blocking responses (403, 406, 415)
-            if status == 403 || status == 406 || status == 415 {
-                waf_block_count += 1;
-            }
             
             if status == 200 {
                 if let Ok(text) = response.text() {
-                    // Check if it's actually a login page by content, not just status code
+                    if record_waf(status, &headers, &text) {
+                        waf_block_count += 1;
+                    }
                     if is_wordpress_login_page(&text) {
                         standard_path_valid = true;
                         if verbose {
@@ -1110,8 +1114,14 @@ impl WordPressDetector {
                         eprintln!("     [verbose] Standard login path {} returned 200 but content doesn't match login page", standard_path);
                     }
                 }
-            } else if verbose {
-                eprintln!("     [verbose] Standard login path {} returned status: {}", standard_path, status);
+            } else {
+                let text = response.text().unwrap_or_default();
+                if record_waf(status, &headers, &text) {
+                    waf_block_count += 1;
+                }
+                if verbose {
+                    eprintln!("     [verbose] Standard login path {} returned status: {}", standard_path, status);
+                }
             }
         } else if verbose {
             eprintln!("     [verbose] Standard login path {} not accessible", standard_path);
@@ -1127,17 +1137,14 @@ impl WordPressDetector {
                 
                 if let Ok(response) = client.get(path, None) {
                     let status = response.status().as_u16();
+                    let headers = Self::extract_response_headers(&response);
                     total_checked += 1;
                     
-                    // Track WAF blocking responses (403, 406, 415)
-                    if status == 403 || status == 406 || status == 415 {
-                        waf_block_count += 1;
-                    }
-                    
-                    // Check both status code AND content
                     if status == 200 {
                         if let Ok(text) = response.text() {
-                            // Verify content is actually a login page
+                            if record_waf(status, &headers, &text) {
+                                waf_block_count += 1;
+                            }
                             if is_wordpress_login_page(&text) {
                                 found_path = Some(path.to_string());
                                 if verbose {
@@ -1148,8 +1155,14 @@ impl WordPressDetector {
                                 eprintln!("     [verbose] Path {} returned 200 but content doesn't match login page", path);
                             }
                         }
-                    } else if verbose {
-                        eprintln!("     [verbose] Path {} returned status: {}", path, status);
+                    } else {
+                        let text = response.text().unwrap_or_default();
+                        if record_waf(status, &headers, &text) {
+                            waf_block_count += 1;
+                        }
+                        if verbose {
+                            eprintln!("     [verbose] Path {} returned status: {}", path, status);
+                        }
                     }
                 } else if verbose {
                     eprintln!("     [verbose] Path {} not accessible", path);
@@ -1157,18 +1170,18 @@ impl WordPressDetector {
             }
         }
         
-        // Check if we're being blocked by WAF (multiple 403/406/415 responses)
-        // If at least 3 paths return WAF blocking status, it's likely WAF blocking
-        let waf_detected = waf_block_count >= 3 && total_checked >= 3;
+        // High-confidence WAF pages on multiple login probes
+        let waf_detected = waf_block_count >= 2 && total_checked >= 2;
         
         if waf_detected {
             use colored::*;
-            eprintln!("{} WAF detected (Imunify/ModSecurity suspected): {} out of {} login path checks returned HTTP 403/406/415", 
+            eprintln!(
+                "{} High-confidence WAF responses on {}/{} login path checks",
                 "⚠".bright_red().bold(),
                 waf_block_count,
-                total_checked);
-            eprintln!("   Uniform blocking behavior detected - stopping scan early to avoid further blocks.");
-            eprintln!("   WAF is actively blocking requests. Consider using --waf-bypass flag for browser-like behavior.");
+                total_checked
+            );
+            eprintln!("   Consider --waf-bypass. Scan will continue unless you stop it.");
         }
         
         // Set login_path based on what we found

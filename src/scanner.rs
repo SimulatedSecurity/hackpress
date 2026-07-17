@@ -17,15 +17,17 @@ impl Scanner {
     pub fn scan(client: &HttpClient, verbose: bool, use_realtime_output: bool, force: bool, stealth: bool, enumerate: Option<Vec<String>>, enumerate_all: Option<Vec<String>>) -> Result<ScanResults> {
         let target = client.base_url.clone();
 
+        crate::error_detection::ErrorDetector::reset_alert_latch();
+
         // Print header at start (only for table format, non-verbose, real-time output)
         if use_realtime_output {
             OutputFormatter::print_header(&target);
         }
 
-        // Browser-like behavior: Visit homepage first when WAF bypass is enabled
-        // This simulates realistic request ordering (/, assets, wp-json, then sensitive paths)
-        // Note: We check if client has waf_bypass, but we can't access it directly
-        // The WAF bypass behavior is handled in HttpClient internally
+        // Warm up session (cookies / CF) when browser-like mode is on
+        if client.waf_bypass_enabled() {
+            let _ = client.get("/", None);
+        }
         
         // Tech stack analysis
         let tech_stack = TechStackAnalyzer::analyze_headers(client).ok();
@@ -68,26 +70,15 @@ impl Scanner {
         let (wordpress_config, waf_detected) = WordPressDetector::check_wordpress_config(client, verbose, use_realtime_output)
             .unwrap_or((None, false));
         
-        // If WAF is detected, stop scan early to avoid further blocks
-        if waf_detected {
+        // Only soft-warn on WAF during config; do not abort a successful scan mid-flight.
+        // Hard abort only when WP was never confirmed and we're clearly challenge-blocked.
+        if waf_detected && !client.waf_bypass_enabled() {
             use colored::*;
-            eprintln!("\n{} Scan stopped early due to WAF blocking detection.", "⚠".bright_red().bold());
-            eprintln!("   To continue scanning with browser-like behavior, use --waf-bypass flag.");
-            return Ok(ScanResults {
-                target,
-                tech_stack,
-                robots_txt,
-                wordpress,
-                wordpress_config,
-                plugins: vec![],
-                themes: vec![],
-                vulnerabilities: vec![],
-                vuln_validations: vec![],
-                exploit_results: vec![],
-                usernames: vec![],
-                file_disclosures: vec![],
-                bruteforce_results: None,
-            });
+            eprintln!(
+                "\n{} WAF challenge/block signatures seen during config checks.",
+                "⚠".bright_yellow().bold()
+            );
+            eprintln!("   Continuing scan. Use --waf-bypass if later modules get blocked.");
         }
         
         // Enumerate themes (output is printed in real-time within enumerate_themes function)
@@ -111,12 +102,15 @@ impl Scanner {
         let mut existing_theme_slugs: std::collections::HashSet<String> = themes.iter().map(|t| t.slug.clone()).collect();
 
         // Enumerate from database files if requested (after passive detection)
-        if let Some(ref enum_types) = enumerate {
-            let use_top = true; // --enumerate uses top files
-            let wants_themes = enum_types.iter().any(|t| t.to_lowercase() == "themes");
-            let wants_plugins = enum_types.iter().any(|t| t.to_lowercase() == "plugins");
+        let db_enum = enumerate
+            .as_ref()
+            .map(|t| (t, true))
+            .or_else(|| enumerate_all.as_ref().map(|t| (t, false)));
 
-            // Enumerate themes first if requested
+        if let Some((enum_types, use_top)) = db_enum {
+            let wants_themes = enum_types.iter().any(|t| t.eq_ignore_ascii_case("themes"));
+            let wants_plugins = enum_types.iter().any(|t| t.eq_ignore_ascii_case("plugins"));
+
             if wants_themes {
                 let enumerated_themes = WordPressDetector::enumerate_themes_from_file(
                     client,
@@ -126,20 +120,18 @@ impl Scanner {
                     &existing_theme_slugs,
                     |current, total| {
                         OutputFormatter::print_progress_bar(current, total, "Enumerating themes");
-                    }
-                ).unwrap_or_default();
+                    },
+                )
+                .unwrap_or_default();
                 OutputFormatter::print_progress_complete();
 
-                // Add only non-duplicate themes
                 for theme in enumerated_themes {
-                    if !existing_theme_slugs.contains(&theme.slug) {
-                        existing_theme_slugs.insert(theme.slug.clone());
+                    if existing_theme_slugs.insert(theme.slug.clone()) {
                         themes.push(theme);
                     }
                 }
             }
 
-            // Enumerate plugins after themes
             if wants_plugins {
                 let enumerated_plugins = WordPressDetector::enumerate_plugins_from_file(
                     client,
@@ -149,66 +141,13 @@ impl Scanner {
                     &existing_plugin_slugs,
                     |current, total| {
                         OutputFormatter::print_progress_bar(current, total, "Enumerating plugins");
-                    }
-                ).unwrap_or_default();
+                    },
+                )
+                .unwrap_or_default();
                 OutputFormatter::print_progress_complete();
 
-                // Add only non-duplicate plugins
                 for plugin in enumerated_plugins {
-                    if !existing_plugin_slugs.contains(&plugin.slug) {
-                        existing_plugin_slugs.insert(plugin.slug.clone());
-                        plugins.push(plugin);
-                    }
-                }
-            }
-        }
-
-        if let Some(ref enum_all_types) = enumerate_all {
-            let use_top = false; // --enumerate-all uses complete files
-            let wants_themes = enum_all_types.iter().any(|t| t.to_lowercase() == "themes");
-            let wants_plugins = enum_all_types.iter().any(|t| t.to_lowercase() == "plugins");
-
-            // Enumerate themes first if requested
-            if wants_themes {
-                let enumerated_themes = WordPressDetector::enumerate_themes_from_file(
-                    client,
-                    verbose,
-                    use_realtime_output,
-                    use_top,
-                    &existing_theme_slugs,
-                    |current, total| {
-                        OutputFormatter::print_progress_bar(current, total, "Enumerating themes");
-                    }
-                ).unwrap_or_default();
-                OutputFormatter::print_progress_complete();
-
-                // Add only non-duplicate themes
-                for theme in enumerated_themes {
-                    if !existing_theme_slugs.contains(&theme.slug) {
-                        existing_theme_slugs.insert(theme.slug.clone());
-                        themes.push(theme);
-                    }
-                }
-            }
-
-            // Enumerate plugins after themes
-            if wants_plugins {
-                let enumerated_plugins = WordPressDetector::enumerate_plugins_from_file(
-                    client,
-                    verbose,
-                    use_realtime_output,
-                    use_top,
-                    &existing_plugin_slugs,
-                    |current, total| {
-                        OutputFormatter::print_progress_bar(current, total, "Enumerating plugins");
-                    }
-                ).unwrap_or_default();
-                OutputFormatter::print_progress_complete();
-
-                // Add only non-duplicate plugins
-                for plugin in enumerated_plugins {
-                    if !existing_plugin_slugs.contains(&plugin.slug) {
-                        existing_plugin_slugs.insert(plugin.slug.clone());
+                    if existing_plugin_slugs.insert(plugin.slug.clone()) {
                         plugins.push(plugin);
                     }
                 }

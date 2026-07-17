@@ -1,11 +1,13 @@
 use colored::*;
-use regex::Regex;
-use reqwest::blocking::Response;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Debug, Clone)]
+static WAF_ALERT_SHOWN: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorType {
     WafBlocked,
+    WafChallenge,
     WebsiteDown,
     ConnectionTimeout,
     DnsError,
@@ -17,283 +19,303 @@ pub enum ErrorType {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WafConfidence {
+    /// Soft signal — log only in verbose, do not abort scan
+    Low,
+    /// Clear block/challenge page — warn once
+    High,
+}
+
 #[derive(Debug, Clone)]
 pub struct ErrorInfo {
     pub error_type: ErrorType,
     pub message: String,
     pub status_code: Option<u16>,
+    #[allow(dead_code)]
     pub headers: HashMap<String, String>,
     pub body_snippet: Option<String>,
+    pub confidence: WafConfidence,
+    pub vendor: Option<String>,
 }
 
 pub struct ErrorDetector;
 
 impl ErrorDetector {
-    /// Check response for WAF blocking indicators
-    #[allow(dead_code)]
-    pub fn detect_waf(response: &Response, body: &str) -> Option<ErrorInfo> {
-        let status = response.status().as_u16();
-        let headers = Self::extract_headers(response);
-        
-        // Common WAF indicators
-        let waf_status_codes = vec![403, 406, 418, 429, 503];
-        let waf_headers = vec![
-            "cf-ray",           // Cloudflare
-            "x-sucuri-id",      // Sucuri
-            "x-sucuri-cache",   // Sucuri
-            "server",           // Check for WAF servers
-            "x-waf",            // Generic WAF header
-            "x-protected-by",   // Generic protection header
-            "x-blocked-by",     // Generic blocking header
-        ];
-        
-        let waf_body_patterns = vec![
-            r"(?i)cloudflare",
-            r"(?i)sucuri",
-            r"(?i)incapsula",
-            r"(?i)akamai",
-            r"(?i)mod_security",
-            r"(?i)blocked",
-            r"(?i)forbidden.*waf",
-            r"(?i)access.*denied.*waf",
-            r"(?i)your request has been blocked",
-            r"(?i)security.*by.*cloudflare",
-            r"(?i)challenge.*required",
-        ];
+    /// Reset once-per-process alert latch (useful for tests / new scan sessions).
+    pub fn reset_alert_latch() {
+        WAF_ALERT_SHOWN.store(false, Ordering::Relaxed);
+    }
 
-        // Check status code
-        if waf_status_codes.contains(&status) {
-            // Check headers for WAF indicators
-            for waf_header in &waf_headers {
-                if headers.keys().any(|k| k.to_lowercase().contains(waf_header)) {
-                    return Some(ErrorInfo {
-                        error_type: ErrorType::WafBlocked,
-                        message: format!("WAF detected ({} header present)", waf_header),
-                        status_code: Some(status),
-                        headers,
-                        body_snippet: Self::extract_body_snippet(body),
-                    });
-                }
-            }
+    /// High-confidence WAF block or JS challenge?
+    pub fn is_waf_block(error: &ErrorInfo) -> bool {
+        matches!(
+            error.error_type,
+            ErrorType::WafBlocked | ErrorType::WafChallenge
+        ) && error.confidence == WafConfidence::High
+    }
 
-            // Check body for WAF patterns
-            for pattern in &waf_body_patterns {
-                let re = Regex::new(pattern).unwrap();
-                if re.is_match(body) {
-                    return Some(ErrorInfo {
-                        error_type: ErrorType::WafBlocked,
-                        message: format!("WAF detected (pattern: {})", pattern),
-                        status_code: Some(status),
-                        headers,
-                        body_snippet: Self::extract_body_snippet(body),
-                    });
-                }
-            }
+    /// Analyze a response for WAF / challenge / rate-limit. Returns None if not a WAF event.
+    ///
+    /// CDN headers alone (e.g. `cf-ray` on a normal Cloudflare site) are NOT treated as a block.
+    pub fn detect_waf(
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &str,
+    ) -> Option<ErrorInfo> {
+        let headers_l: HashMap<String, String> = headers
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.clone()))
+            .collect();
+        let body_l = body.to_lowercase();
+        let vendor = Self::guess_vendor(&headers_l, &body_l);
 
-            // If 403 with no other indicators, might still be WAF
-            if status == 403 {
-                return Some(ErrorInfo {
-                    error_type: ErrorType::WafBlocked,
-                    message: "Possible WAF blocking (403 Forbidden)".to_string(),
-                    status_code: Some(status),
+        // Explicit Cloudflare mitigation header
+        if let Some(mitigated) = headers_l.get("cf-mitigated") {
+            let m = mitigated.to_lowercase();
+            if m.contains("challenge") {
+                return Some(Self::waf_info(
+                    ErrorType::WafChallenge,
+                    WafConfidence::High,
+                    format!("Cloudflare challenge ({})", mitigated),
+                    status,
                     headers,
-                    body_snippet: Self::extract_body_snippet(body),
-                });
+                    body,
+                    vendor.or(Some("cloudflare".into())),
+                ));
+            }
+            return Some(Self::waf_info(
+                ErrorType::WafBlocked,
+                WafConfidence::High,
+                format!("Cloudflare mitigation ({})", mitigated),
+                status,
+                headers,
+                body,
+                vendor.or(Some("cloudflare".into())),
+            ));
+        }
+
+        // Strong body signatures (work on 200 challenge pages too)
+        if let Some((kind, label)) = Self::match_block_body(&body_l) {
+            return Some(Self::waf_info(
+                kind,
+                WafConfidence::High,
+                label,
+                status,
+                headers,
+                body,
+                vendor,
+            ));
+        }
+
+        // Rate limit
+        if status == 429
+            || (headers_l.contains_key("retry-after") && body_l.contains("rate"))
+        {
+            return Some(Self::waf_info(
+                ErrorType::RateLimited,
+                WafConfidence::High,
+                "Rate limited (429 / Retry-After)".into(),
+                status,
+                headers,
+                body,
+                vendor,
+            ));
+        }
+
+        // Hard block statuses need a supporting signal — never "any 403"
+        if matches!(status, 403 | 406 | 418 | 503) {
+            if Self::has_block_header(&headers_l) {
+                return Some(Self::waf_info(
+                    ErrorType::WafBlocked,
+                    WafConfidence::High,
+                    format!("WAF block headers with HTTP {}", status),
+                    status,
+                    headers,
+                    body,
+                    vendor,
+                ));
+            }
+
+            // Soft: blocking status behind a known CDN, no clear page signature
+            if vendor.is_some() && status == 403 {
+                return Some(Self::waf_info(
+                    ErrorType::WafBlocked,
+                    WafConfidence::Low,
+                    format!(
+                        "HTTP {} behind {} (may be WAF or normal forbid)",
+                        status,
+                        vendor.as_deref().unwrap_or("CDN")
+                    ),
+                    status,
+                    headers,
+                    body,
+                    vendor,
+                ));
             }
         }
 
         None
     }
 
-    /// Check request error for website down or connection issues
     pub fn detect_request_error(error: &anyhow::Error) -> Option<ErrorInfo> {
         let error_msg = error.to_string().to_lowercase();
 
-        // Connection timeout
         if error_msg.contains("timeout") || error_msg.contains("timed out") {
             return Some(ErrorInfo {
                 error_type: ErrorType::ConnectionTimeout,
-                message: "Connection timeout - website may be slow or unresponsive".to_string(),
+                message: "Connection timeout - website may be slow or unresponsive".into(),
                 status_code: None,
                 headers: HashMap::new(),
                 body_snippet: None,
+                confidence: WafConfidence::High,
+                vendor: None,
             });
         }
 
-        // DNS errors
-        if error_msg.contains("dns") || error_msg.contains("resolve") || error_msg.contains("name resolution") {
+        if error_msg.contains("dns")
+            || error_msg.contains("resolve")
+            || error_msg.contains("name resolution")
+        {
             return Some(ErrorInfo {
                 error_type: ErrorType::DnsError,
-                message: "DNS resolution failed - website may be down or domain invalid".to_string(),
+                message: "DNS resolution failed - website may be down or domain invalid".into(),
                 status_code: None,
                 headers: HashMap::new(),
                 body_snippet: None,
+                confidence: WafConfidence::High,
+                vendor: None,
             });
         }
 
-        // SSL/TLS errors
-        if error_msg.contains("ssl") || error_msg.contains("tls") || error_msg.contains("certificate") {
+        if error_msg.contains("ssl")
+            || error_msg.contains("tls")
+            || error_msg.contains("certificate")
+        {
             return Some(ErrorInfo {
                 error_type: ErrorType::SslError,
-                message: "SSL/TLS error - certificate issue or connection problem".to_string(),
+                message: "SSL/TLS error - certificate issue or connection problem".into(),
                 status_code: None,
                 headers: HashMap::new(),
                 body_snippet: None,
+                confidence: WafConfidence::High,
+                vendor: None,
             });
         }
 
-        // Connection refused / website down
-        if error_msg.contains("connection refused") 
+        if error_msg.contains("connection refused")
             || error_msg.contains("connection reset")
             || error_msg.contains("failed to connect")
-            || error_msg.contains("network unreachable") {
+            || error_msg.contains("network unreachable")
+        {
             return Some(ErrorInfo {
                 error_type: ErrorType::WebsiteDown,
-                message: "Connection failed - website may be down or unreachable".to_string(),
+                message: "Connection failed - website may be down or unreachable".into(),
                 status_code: None,
                 headers: HashMap::new(),
                 body_snippet: None,
+                confidence: WafConfidence::High,
+                vendor: None,
             });
         }
 
-        // Rate limiting
         if error_msg.contains("rate limit") || error_msg.contains("too many requests") {
             return Some(ErrorInfo {
                 error_type: ErrorType::RateLimited,
-                message: "Rate limited - too many requests".to_string(),
+                message: "Rate limited - too many requests".into(),
                 status_code: Some(429),
                 headers: HashMap::new(),
                 body_snippet: None,
+                confidence: WafConfidence::High,
+                vendor: None,
             });
         }
 
         None
     }
 
-    /// Check response status for common error conditions (without Response object)
-    pub fn detect_response_error_with_status(status: u16, headers: &HashMap<String, String>, body: &str) -> Option<ErrorInfo> {
-        // Create a mock response-like structure for WAF detection
-        // Check WAF first
-        if let Some(waf_error) = Self::detect_waf_from_status(status, headers, body) {
-            return Some(waf_error);
+    /// Classify response errors. WAF only when `detect_waf` agrees — plain 403/404 are not WAF.
+    pub fn detect_response_error_with_status(
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &str,
+    ) -> Option<ErrorInfo> {
+        if let Some(waf) = Self::detect_waf(status, headers, body) {
+            // Only surface high-confidence WAF / rate-limit as alerts by default
+            if waf.confidence == WafConfidence::High
+                || matches!(waf.error_type, ErrorType::RateLimited)
+            {
+                return Some(waf);
+            }
+            // Low confidence: fall through to generic status handling (e.g. PermissionDenied)
         }
-        
-        // Other error types
+
         match status {
             404 => Some(ErrorInfo {
                 error_type: ErrorType::NotFound,
-                message: "Resource not found (404)".to_string(),
+                message: "Resource not found (404)".into(),
                 status_code: Some(status),
                 headers: headers.clone(),
                 body_snippet: None,
+                confidence: WafConfidence::High,
+                vendor: None,
             }),
             403 => Some(ErrorInfo {
                 error_type: ErrorType::PermissionDenied,
-                message: "Permission denied (403) - access forbidden".to_string(),
+                message: "Permission denied (403)".into(),
                 status_code: Some(status),
                 headers: headers.clone(),
                 body_snippet: Self::extract_body_snippet(body),
+                confidence: WafConfidence::High,
+                vendor: None,
             }),
             429 => Some(ErrorInfo {
                 error_type: ErrorType::RateLimited,
-                message: "Rate limited (429) - too many requests".to_string(),
+                message: "Rate limited (429)".into(),
                 status_code: Some(status),
                 headers: headers.clone(),
                 body_snippet: Self::extract_body_snippet(body),
+                confidence: WafConfidence::High,
+                vendor: None,
             }),
             s if s >= 500 => Some(ErrorInfo {
                 error_type: ErrorType::WebsiteDown,
-                message: format!("Server error ({}) - website may be experiencing issues", s),
+                message: format!("Server error ({})", s),
                 status_code: Some(s),
                 headers: headers.clone(),
                 body_snippet: Self::extract_body_snippet(body),
+                confidence: WafConfidence::High,
+                vendor: None,
             }),
             _ => None,
         }
     }
-    
-    fn detect_waf_from_status(status: u16, headers: &HashMap<String, String>, body: &str) -> Option<ErrorInfo> {
-        // Common WAF indicators
-        let waf_status_codes = vec![403, 406, 418, 429, 503];
-        let waf_headers = vec![
-            "cf-ray",           // Cloudflare
-            "x-sucuri-id",      // Sucuri
-            "x-sucuri-cache",   // Sucuri
-            "x-waf",            // Generic WAF header
-            "x-protected-by",   // Generic protection header
-            "x-blocked-by",     // Generic blocking header
-        ];
-        
-        let waf_body_patterns = vec![
-            r"(?i)cloudflare",
-            r"(?i)sucuri",
-            r"(?i)incapsula",
-            r"(?i)akamai",
-            r"(?i)mod_security",
-            r"(?i)blocked",
-            r"(?i)forbidden.*waf",
-            r"(?i)your request has been blocked",
-            r"(?i)security.*by.*cloudflare",
-        ];
 
-        if waf_status_codes.contains(&status) {
-            // Check headers
-            for (key, value) in headers {
-                let key_lower = key.to_lowercase();
-                for waf_header in &waf_headers {
-                    if key_lower.contains(waf_header) {
-                        return Some(ErrorInfo {
-                            error_type: ErrorType::WafBlocked,
-                            message: format!("WAF detected ({}: {})", key, value),
-                            status_code: Some(status),
-                            headers: headers.clone(),
-                            body_snippet: Self::extract_body_snippet(body),
-                        });
-                    }
-                }
-            }
+    /// Print alert. WAF/challenge alerts are shown at most once per process unless `verbose`.
+    pub fn alert_error(error_info: &ErrorInfo, verbose: bool) {
+        // Skip noisy expected errors unless verbose
+        if !verbose
+            && matches!(
+                error_info.error_type,
+                ErrorType::NotFound | ErrorType::PermissionDenied
+            )
+        {
+            return;
+        }
 
-            // Check body
-            for pattern in &waf_body_patterns {
-                let re = Regex::new(pattern).unwrap();
-                if re.is_match(body) {
-                    return Some(ErrorInfo {
-                        error_type: ErrorType::WafBlocked,
-                        message: format!("WAF detected in response body"),
-                        status_code: Some(status),
-                        headers: headers.clone(),
-                        body_snippet: Self::extract_body_snippet(body),
-                    });
-                }
-            }
+        let is_waf = matches!(
+            error_info.error_type,
+            ErrorType::WafBlocked | ErrorType::WafChallenge
+        );
 
-            // If 403 with suspicious indicators
-            if status == 403 && !body.is_empty() {
-                return Some(ErrorInfo {
-                    error_type: ErrorType::WafBlocked,
-                    message: "Possible WAF blocking (403 Forbidden)".to_string(),
-                    status_code: Some(status),
-                    headers: headers.clone(),
-                    body_snippet: Self::extract_body_snippet(body),
-                });
+        if is_waf && !verbose {
+            if WAF_ALERT_SHOWN.swap(true, Ordering::Relaxed) {
+                return;
             }
         }
 
-        None
-    }
-
-    /// Check response status for common error conditions
-    #[allow(dead_code)]
-    pub fn detect_response_error(response: &Response, body: &str) -> Option<ErrorInfo> {
-        let status = response.status().as_u16();
-        let headers = Self::extract_headers(response);
-        Self::detect_response_error_with_status(status, &headers, body)
-    }
-
-    /// Print error alert to user
-    pub fn alert_error(error_info: &ErrorInfo, verbose: bool) {
         let (icon, color) = match error_info.error_type {
-            ErrorType::WafBlocked => ("⚠", "yellow"),
+            ErrorType::WafBlocked | ErrorType::WafChallenge => ("⚠", "yellow"),
             ErrorType::WebsiteDown => ("✗", "red"),
             ErrorType::ConnectionTimeout => ("⏱", "yellow"),
             ErrorType::DnsError => ("✗", "red"),
@@ -311,23 +333,37 @@ impl ErrorDetector {
             _ => icon.bright_white(),
         };
 
-        // For WAF detection, show simplified message with status code
-        if matches!(error_info.error_type, ErrorType::WafBlocked) {
-            if let Some(status) = error_info.status_code {
-                eprintln!(
-                    "\n{} {} WAF detected (HTTP {})",
-                    icon_colored,
-                    "[ALERT]".bright_red().bold(),
-                    status.to_string().bright_cyan()
-                );
+        if is_waf {
+            let kind = if error_info.error_type == ErrorType::WafChallenge {
+                "WAF challenge"
             } else {
-                eprintln!(
-                    "\n{} {} {}",
-                    icon_colored,
-                    "[ALERT]".bright_red().bold(),
-                    error_info.message.bright_yellow()
-                );
+                "WAF block"
+            };
+            let vendor = error_info
+                .vendor
+                .as_deref()
+                .map(|v| format!(" [{}]", v))
+                .unwrap_or_default();
+            let status = error_info
+                .status_code
+                .map(|s| format!(" HTTP {}", s))
+                .unwrap_or_default();
+
+            eprintln!(
+                "\n{} {} {}{}{}",
+                icon_colored,
+                "[ALERT]".bright_red().bold(),
+                kind.bright_yellow(),
+                vendor.bright_cyan(),
+                status.bright_cyan()
+            );
+            if verbose {
+                eprintln!("   {}", error_info.message.bright_black());
             }
+            eprintln!(
+                "   {} Retry with --waf-bypass (browser headers + throttling), or --force to continue anyway",
+                "→".bright_blue()
+            );
         } else {
             eprintln!(
                 "\n{} {} {}",
@@ -335,76 +371,218 @@ impl ErrorDetector {
                 "[ALERT]".bright_red().bold(),
                 error_info.message.bright_yellow()
             );
-
             if verbose {
                 if let Some(status) = error_info.status_code {
                     eprintln!("   Status Code: {}", status.to_string().bright_cyan());
                 }
-
-                if !error_info.headers.is_empty() {
-                    eprintln!("   Headers:");
-                    for (key, value) in &error_info.headers {
-                        if key.to_lowercase().contains("waf")
-                            || key.to_lowercase().contains("cf-")
-                            || key.to_lowercase().contains("sucuri")
-                            || key.to_lowercase().contains("x-blocked")
-                        {
-                            eprintln!("     {}: {}", key.bright_red(), value.bright_red());
-                        } else {
-                            eprintln!("     {}: {}", key, value);
-                        }
-                    }
-                }
-
                 if let Some(snippet) = &error_info.body_snippet {
                     eprintln!("   Response snippet: {}", snippet.bright_black());
                 }
             }
+            match error_info.error_type {
+                ErrorType::RateLimited => {
+                    eprintln!(
+                        "   {} Reduce rate or use --waf-bypass throttling",
+                        "→".bright_blue()
+                    );
+                }
+                ErrorType::WebsiteDown | ErrorType::ConnectionTimeout => {
+                    eprintln!(
+                        "   {} Verify the site is reachable",
+                        "→".bright_blue()
+                    );
+                }
+                _ => {}
+            }
         }
-
-        // Provide recommendations
-        match error_info.error_type {
-            ErrorType::WafBlocked => {
-                eprintln!(
-                    "   {} Try using --waf-bypass flag to enable bypass techniques",
-                    "→".bright_blue()
-                );
-            }
-            ErrorType::RateLimited => {
-                eprintln!(
-                    "   {} Reduce request rate or wait before retrying",
-                    "→".bright_blue()
-                );
-            }
-            ErrorType::WebsiteDown | ErrorType::ConnectionTimeout => {
-                eprintln!(
-                    "   {} Verify the website is accessible and try again",
-                    "→".bright_blue()
-                );
-            }
-            _ => {}
-        }
-        eprintln!();
         eprintln!();
     }
 
-    #[allow(dead_code)]
-    fn extract_headers(response: &Response) -> HashMap<String, String> {
-        let mut headers = HashMap::new();
-        for (key, value) in response.headers() {
-            if let Ok(value_str) = value.to_str() {
-                headers.insert(key.to_string(), value_str.to_string());
+    fn waf_info(
+        error_type: ErrorType,
+        confidence: WafConfidence,
+        message: String,
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &str,
+        vendor: Option<String>,
+    ) -> ErrorInfo {
+        ErrorInfo {
+            error_type,
+            message,
+            status_code: Some(status),
+            headers: headers.clone(),
+            body_snippet: Self::extract_body_snippet(body),
+            confidence,
+            vendor,
+        }
+    }
+
+    fn guess_vendor(headers_l: &HashMap<String, String>, body_l: &str) -> Option<String> {
+        if headers_l.contains_key("cf-ray")
+            || headers_l
+                .get("server")
+                .map(|s| s.to_lowercase().contains("cloudflare"))
+                .unwrap_or(false)
+            || body_l.contains("cloudflare")
+        {
+            return Some("cloudflare".into());
+        }
+        if headers_l.keys().any(|k| k.contains("sucuri")) || body_l.contains("sucuri") {
+            return Some("sucuri".into());
+        }
+        if body_l.contains("incapsula") || headers_l.contains_key("x-iinfo") {
+            return Some("incapsula".into());
+        }
+        if body_l.contains("akamai") || headers_l.contains_key("x-akamai-transformed") {
+            return Some("akamai".into());
+        }
+        if body_l.contains("mod_security") || body_l.contains("modsecurity") {
+            return Some("modsecurity".into());
+        }
+        if body_l.contains("imunify") {
+            return Some("imunify360".into());
+        }
+        if headers_l.contains_key("x-waf") || headers_l.contains_key("x-blocked-by") {
+            return Some("generic-waf".into());
+        }
+        None
+    }
+
+    fn has_block_header(headers_l: &HashMap<String, String>) -> bool {
+        headers_l.contains_key("x-sucuri-block")
+            || headers_l.contains_key("x-blocked-by")
+            || headers_l.contains_key("x-waf-event")
+            || headers_l
+                .get("server")
+                .map(|s| s.to_lowercase().contains("imunify360"))
+                .unwrap_or(false)
+    }
+
+    fn match_block_body(body_l: &str) -> Option<(ErrorType, String)> {
+        let challenge_patterns = [
+            ("just a moment", "Cloudflare JS challenge page"),
+            ("cf-browser-verification", "Cloudflare browser verification"),
+            ("cf-challenge", "Cloudflare challenge"),
+            ("checking your browser", "Browser check / challenge"),
+            ("attention required", "Cloudflare attention required"),
+            ("enable javascript and cookies", "JS/cookie challenge"),
+        ];
+        for (pat, label) in challenge_patterns {
+            if body_l.contains(pat) {
+                return Some((ErrorType::WafChallenge, label.into()));
             }
         }
-        headers
+
+        let block_patterns = [
+            ("sorry, you have been blocked", "Cloudflare hard block"),
+            ("you have been blocked", "WAF hard block"),
+            ("your request has been blocked", "Request blocked by WAF"),
+            ("access denied", "Access denied page"), // careful - many WP pages say this
+            ("the owner of this website has banned your access", "IP banned by WAF"),
+            ("this website is using a security service", "Security service interstitial"),
+            ("sucuri website firewall", "Sucuri firewall block"),
+            ("incapsula incident id", "Incapsula block"),
+            ("mod_security", "ModSecurity block"),
+            ("imunify360", "Imunify360 block"),
+            ("request rejected", "Request rejected by WAF"),
+            ("cf-error-details", "Cloudflare error details"),
+            ("error 1020", "Cloudflare Error 1020 (Access Denied)"),
+            ("error 1015", "Cloudflare Error 1015 (Rate Limited)"),
+        ];
+
+        for (pat, label) in block_patterns {
+            if body_l.contains(pat) {
+                // "access denied" alone is too weak without other context
+                if pat == "access denied"
+                    && !body_l.contains("cloudflare")
+                    && !body_l.contains("firewall")
+                    && !body_l.contains("waf")
+                    && !body_l.contains("security")
+                {
+                    continue;
+                }
+                return Some((ErrorType::WafBlocked, label.into()));
+            }
+        }
+
+        None
     }
 
     fn extract_body_snippet(body: &str) -> Option<String> {
-        let snippet = body.chars().take(200).collect::<String>();
+        let snippet: String = body.chars().take(200).collect();
         if snippet.is_empty() {
             None
         } else {
             Some(snippet)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn cdn_headers_alone_not_a_block() {
+        let h = headers(&[("cf-ray", "abc-123"), ("server", "cloudflare")]);
+        // Normal 200 homepage behind Cloudflare
+        assert!(ErrorDetector::detect_waf(200, &h, "<html>WordPress</html>").is_none());
+        // Plain 403 without block page → low confidence only
+        let r = ErrorDetector::detect_waf(403, &h, "Forbidden");
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().confidence, WafConfidence::Low);
+    }
+
+    #[test]
+    fn cloudflare_challenge_page_is_high() {
+        let h = headers(&[("cf-ray", "abc")]);
+        let body = "<html>Just a moment... cf-browser-verification</html>";
+        let r = ErrorDetector::detect_waf(403, &h, body).unwrap();
+        assert_eq!(r.error_type, ErrorType::WafChallenge);
+        assert_eq!(r.confidence, WafConfidence::High);
+    }
+
+    #[test]
+    fn cf_mitigated_header() {
+        let h = headers(&[("cf-mitigated", "challenge"), ("cf-ray", "x")]);
+        let r = ErrorDetector::detect_waf(403, &h, "").unwrap();
+        assert_eq!(r.error_type, ErrorType::WafChallenge);
+        assert_eq!(r.confidence, WafConfidence::High);
+    }
+
+    #[test]
+    fn plain_403_not_surfaced_as_waf_alert() {
+        let h = headers(&[("server", "nginx")]);
+        // No CDN → detect_waf returns None; response classifier → PermissionDenied
+        assert!(ErrorDetector::detect_waf(403, &h, "Forbidden").is_none());
+        let e = ErrorDetector::detect_response_error_with_status(403, &h, "Forbidden").unwrap();
+        assert_eq!(e.error_type, ErrorType::PermissionDenied);
+    }
+
+    #[test]
+    fn low_confidence_not_returned_from_response_classifier() {
+        let h = headers(&[("cf-ray", "abc"), ("server", "cloudflare")]);
+        // Low confidence WAF must not spam via detect_response_error_with_status
+        let e = ErrorDetector::detect_response_error_with_status(403, &h, "Forbidden");
+        // Falls through to PermissionDenied OR None for low waf — we return None for low then PermissionDenied
+        assert!(e.is_some());
+        assert_eq!(e.unwrap().error_type, ErrorType::PermissionDenied);
+    }
+
+    #[test]
+    fn hard_block_body() {
+        let h = headers(&[("cf-ray", "x")]);
+        let body = "Sorry, you have been blocked. Cloudflare Error 1020";
+        let r = ErrorDetector::detect_waf(403, &h, body).unwrap();
+        assert_eq!(r.error_type, ErrorType::WafBlocked);
+        assert_eq!(r.confidence, WafConfidence::High);
     }
 }

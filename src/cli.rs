@@ -140,7 +140,7 @@ pub enum Commands {
         /// Path to file containing passwords
         #[arg(short, long)]
         passwords: String,
-        /// Type of bruteforcing endpoint (wp-login, xmlrpc, rest-api, custom)
+        /// Type of bruteforcing endpoint (wp-login, xmlrpc, rest-api)
         #[arg(long, default_value = "wp-login")]
         bruteforce_type: String,
         /// Requests per second (default: 10)
@@ -160,7 +160,7 @@ pub enum Commands {
         /// Path to file containing passwords
         #[arg(short, long)]
         passwords: String,
-        /// Type of bruteforcing endpoint (wp-login, xmlrpc, rest-api, custom)
+        /// Type of bruteforcing endpoint (wp-login, xmlrpc, rest-api)
         #[arg(long, default_value = "wp-login")]
         bruteforce_type: String,
         /// Requests per second (default: 2)
