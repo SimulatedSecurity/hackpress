@@ -106,6 +106,7 @@ docs/                Template guide
 ## Documentation
 
 - [Templates](docs/TEMPLATES.md) — structure, matchers, extractors, raw HTTP, examples
+- [Releases](docs/RELEASE.md) — tagging and multi-platform binary uploads (maintainers)
 
 Older doc filenames redirect there: `TEMPLATE_TUTORIAL.md`, `EXPLOIT_TEMPLATES.md`, `VULN_TEMPLATES.md`.
 

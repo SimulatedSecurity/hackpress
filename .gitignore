@@ -3,3 +3,6 @@
 /crawler
 /scrapers
 plan.md
+
+# Local-only multi-platform release workflow (do not publish)
+.github/workflows/release.yml
