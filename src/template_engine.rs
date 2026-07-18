@@ -289,11 +289,34 @@ impl TemplateEngine {
         };
 
         let details = if matched {
-            format!(
+            let mut parts = vec![format!(
                 "Status: {}, Response length: {}",
                 last.status,
                 last.body.len()
-            )
+            )];
+            let mut seen = std::collections::HashSet::new();
+            let mut push_extracted = |name: &str, raw: &str| {
+                if seen.insert(name.to_string()) {
+                    parts.push(format!("{}={}", name, raw));
+                }
+            };
+            for extractor in template_extractors {
+                if let Some(name) = extractor.name.as_ref().or(extractor.group_name.as_ref()) {
+                    if let Some(raw) = variables.get(name) {
+                        push_extracted(name, raw);
+                    }
+                }
+            }
+            for request in http {
+                for extractor in &request.extractors {
+                    if let Some(name) = extractor.name.as_ref().or(extractor.group_name.as_ref()) {
+                        if let Some(raw) = variables.get(name) {
+                            push_extracted(name, raw);
+                        }
+                    }
+                }
+            }
+            parts.join(" | ")
         } else {
             "Matchers did not match".to_string()
         };

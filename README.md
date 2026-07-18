@@ -99,14 +99,31 @@ Useful: `set` / `unset` / `show options`, `scan`, `vuln`, `exploit`, `bruteforce
 src/                 Rust CLI (scan, templates, bruteforce, …)
 templates/exploits/  Exploit templates
 templates/vulns/     Validation templates
+vuln_dockers/        Docker labs for local CVE template validation
 database/            Local cache (plugins*.txt, themes*.txt, vulns.json)
 docs/                Template guide
+```
+
+## Vulnerability Docker labs
+
+Pinned WordPress (or plugin) stacks under [`vuln_dockers/`](vuln_dockers/) for validating templates locally. See [vuln_dockers/README.md](vuln_dockers/README.md).
+
+Example — wp2shell / CVE-2026-63030 (WordPress 7.0.1):
+
+```bash
+cd vuln_dockers/wp2shell-cve
+docker compose up -d
+docker compose logs -f wp-setup   # wait for "Lab ready"
+
+# from repo root
+hackpress vuln http://localhost:8080 --template templates/vulns/wp2shell-cve-2026-63030.json -v
 ```
 
 ## Documentation
 
 - [Templates](docs/TEMPLATES.md) — structure, matchers, extractors, raw HTTP, examples
 - [Releases](docs/RELEASE.md) — tagging and multi-platform binary uploads (maintainers)
+- [Vulnerability Docker labs](vuln_dockers/README.md) — local CVE environments
 
 Older doc filenames redirect there: `TEMPLATE_TUTORIAL.md`, `EXPLOIT_TEMPLATES.md`, `VULN_TEMPLATES.md`.
 

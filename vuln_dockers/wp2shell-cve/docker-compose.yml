@@ -1,0 +1,87 @@
+# Local lab for wp2shell / CVE-2026-63030 template validation.
+# WordPress 7.0.1 is in the affected range (fixed in 7.0.2).
+#
+# Usage:
+#   cd vuln_dockers/wp2shell-cve
+#   docker compose up -d
+#   docker compose logs -f wp-setup   # wait until "Lab ready"
+#
+# Then from repo root:
+#   hackpress vuln http://localhost:8080 --template templates/vulns/wp2shell-cve-2026-63030.json -v
+#   # or if /wp-json is still 404:
+#   hackpress vuln http://localhost:8080 --template templates/vulns/wp2shell-cve-2026-63030-rest-route.json -v
+
+name: hackpress-wp2shell-lab
+
+services:
+  db:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wordpress}
+      MYSQL_USER: ${MYSQL_USER:-wordpress}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-wordpress}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  wordpress:
+    image: ${WORDPRESS_IMAGE:-wordpress:7.0.1-apache}
+    restart: unless-stopped
+    ports:
+      - "${WP_PORT:-8080}:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: ${MYSQL_USER:-wordpress}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD:-wordpress}
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE:-wordpress}
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_HOME', '${WP_URL:-http://localhost:8080}');
+        define('WP_SITEURL', '${WP_URL:-http://localhost:8080}');
+        define('DISALLOW_FILE_EDIT', false);
+    volumes:
+      - wp_data:/var/www/html
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # File check only — HTTP to 127.0.0.1 redirects to WP_HOME (localhost:8080) and breaks inside the container.
+      test: ["CMD-SHELL", "test -f /var/www/html/wp-includes/version.php"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  wp-setup:
+    image: ${WORDPRESS_CLI_IMAGE:-wordpress:cli-php8.3}
+    user: "33:33"
+    volumes:
+      - wp_data:/var/www/html
+      - ./setup.sh:/setup.sh:ro
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: ${MYSQL_USER:-wordpress}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD:-wordpress}
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE:-wordpress}
+      WP_URL: ${WP_URL:-http://localhost:8080}
+      WP_ADMIN_USER: ${WP_ADMIN_USER:-admin}
+      WP_ADMIN_PASSWORD: ${WP_ADMIN_PASSWORD:-admin}
+      WP_ADMIN_EMAIL: ${WP_ADMIN_EMAIL:-admin@lab.local}
+      WP_TITLE: ${WP_TITLE:-wp2shell-lab}
+    depends_on:
+      wordpress:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/setup.sh"]
+    restart: "on-failure"
+
+volumes:
+  db_data:
+  wp_data:
