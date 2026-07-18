@@ -268,6 +268,39 @@ impl WordPressDetector {
             }
         }
 
+        // Method 6 (last resort): core asset ?ver= on homepage (/wp-includes/…?ver=X.Y.Z)
+        // Only trusted filenames that WordPress versions with $wp_version (not jQuery etc.).
+        if version.is_none() {
+            if verbose {
+                eprintln!("     [verbose] Trying core asset ?ver= fallback on homepage...");
+            }
+            if let Ok(response) = client.get("", None) {
+                if response.status().as_u16() < 500 {
+                    if let Ok(text) = response.text() {
+                        if let Some(ver) = Self::extract_wp_version_from_includes_assets(&text) {
+                            detected = true;
+                            version = Some(ver.clone());
+                            if verbose {
+                                eprintln!(
+                                    "     [verbose] Found WordPress version {} from wp-includes asset ?ver=",
+                                    ver
+                                );
+                            }
+                        } else if text.to_lowercase().contains("wp-includes")
+                            || text.to_lowercase().contains("wp-content")
+                        {
+                            detected = true;
+                            if verbose {
+                                eprintln!(
+                                    "     [verbose] Homepage has WordPress paths but no trusted core ?ver="
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Fallback: Check for wp-content directory (detection only, no version)
         // Only set detected if we can confirm it's actually a WordPress wp-content directory
         if !detected {
@@ -555,6 +588,37 @@ impl WordPressDetector {
         if let Some(caps) = re.captures(generator) {
             if let Some(version_match) = caps.get(1) {
                 return Some(version_match.as_str().to_string());
+            }
+        }
+        None
+    }
+
+    /// Last-resort core version from trusted `/wp-includes/` assets that use `$wp_version` as `?ver=`.
+    /// Skips bundled libs (jQuery, etc.) and content-hash `?ver=` values.
+    pub(crate) fn extract_wp_version_from_includes_assets(html: &str) -> Option<String> {
+        const CORE_FILES: &[&str] = &[
+            "wp-emoji-release.min.js",
+            "wp-emoji-release.js",
+            "wp-emoji-loader.min.js",
+            "wp-emoji-loader.js",
+            "wp-embed.min.js",
+            "wp-embed.js",
+        ];
+
+        for file in CORE_FILES {
+            // Allow JSON-escaped slashes (\/) between wp-includes and the filename.
+            let pattern = format!(
+                r#"(?i)wp-includes.{{0,120}}{}[?&]ver=([\d]+\.[\d]+(?:\.[\d]+)?)"#,
+                regex::escape(file)
+            );
+            let re = Regex::new(&pattern).ok()?;
+            if let Some(caps) = re.captures(html) {
+                if let Some(v) = caps.get(1) {
+                    let ver_str = v.as_str().to_string();
+                    if ver_str.contains('.') && ver_str.matches('.').count() <= 2 {
+                        return Some(ver_str);
+                    }
+                }
             }
         }
         None
@@ -1467,6 +1531,42 @@ mod tests {
         assert_eq!(
             WordPressDetector::compare_wordpress_versions("3.26.0", "3.26.0"),
             0
+        );
+    }
+
+    #[test]
+    fn extract_wp_version_from_includes_assets_emoji_release() {
+        let html = r#"<script src="https://example.com/wp-includes/js/wp-emoji-release.min.js?ver=7.0.2"></script>"#;
+        assert_eq!(
+            WordPressDetector::extract_wp_version_from_includes_assets(html).as_deref(),
+            Some("7.0.2")
+        );
+    }
+
+    #[test]
+    fn extract_wp_version_from_includes_assets_json_escaped() {
+        let html = r#"{"concatemoji":"https:\/\/lp.example.com\/wp-includes\/js\/wp-emoji-release.min.js?ver=7.0.2"}"#;
+        assert_eq!(
+            WordPressDetector::extract_wp_version_from_includes_assets(html).as_deref(),
+            Some("7.0.2")
+        );
+    }
+
+    #[test]
+    fn extract_wp_version_from_includes_assets_ignores_jquery() {
+        let html = r#"<script src="/wp-includes/js/jquery/jquery.min.js?ver=3.7.1"></script>"#;
+        assert_eq!(
+            WordPressDetector::extract_wp_version_from_includes_assets(html),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_wp_version_from_includes_assets_ignores_content_hash() {
+        let html = r#"<script src="/wp-includes/js/dist/hooks.min.js?ver=7496969728ca0f95732d"></script>"#;
+        assert_eq!(
+            WordPressDetector::extract_wp_version_from_includes_assets(html),
+            None
         );
     }
 }
