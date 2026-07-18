@@ -472,6 +472,24 @@ impl OutputFormatter {
         println!();
     }
 
+    /// Compact one-liner for `--url-list` mode: `1/30 [label] URL - vulnerable|not vulnerable`
+    pub fn print_url_list_result(
+        index: usize,
+        total: usize,
+        label: &str,
+        url: &str,
+        vulnerable: bool,
+    ) {
+        let progress = format!("{}/{}", index, total).bright_cyan();
+        let tag = format!("[{}]", label).bright_yellow();
+        let status = if vulnerable {
+            "vulnerable".bright_red().bold()
+        } else {
+            "not vulnerable".bright_green()
+        };
+        println!("{} {} {} - {}", progress, tag, url.bright_white(), status);
+    }
+
     pub fn format(results: &ScanResults, format: &str, verbose: bool) -> String {
         match format {
             "json" => Self::format_json(results),

@@ -5,6 +5,7 @@ use rustyline::DefaultEditor;
 
 pub struct InteractiveSession {
     target: Option<String>,
+    url_list: Option<String>,
     waf_bypass: bool,
     stealth: bool,
     verbose: bool,
@@ -19,6 +20,7 @@ impl InteractiveSession {
     pub fn new() -> Self {
         Self {
             target: None,
+            url_list: None,
             waf_bypass: false,
             stealth: false,
             verbose: false,
@@ -82,11 +84,15 @@ impl InteractiveSession {
     }
 
     fn get_prompt_plain(&self) -> String {
-        let target_display = self
-            .target
-            .as_ref()
-            .map(|t| t.as_str())
-            .unwrap_or("not set");
+        let target_display = if let Some(ref list) = self.url_list {
+            format!("url-list:{}", list)
+        } else {
+            self.target
+                .as_ref()
+                .map(|t| t.as_str())
+                .unwrap_or("not set")
+                .to_string()
+        };
         // Use plain text prompt to avoid ANSI code issues on Windows terminals
         format!("hackpress [{}] > ", target_display)
     }
@@ -154,7 +160,8 @@ impl InteractiveSession {
         println!();
         println!("{}", "Available Commands:".bright_cyan().bold());
         println!();
-        println!("  {} {}", "set".bright_green(), "target <url>          Set target URL");
+        println!("  {} {}", "set".bright_green(), "target <url>          Set single target URL");
+        println!("  {} {}", "set".bright_green(), "url-list <file>       Set targets file (one URL per line)");
         println!("  {} {}", "set".bright_green(), "waf-bypass            Enable WAF bypass");
         println!("  {} {}", "set".bright_green(), "stealth               Enable stealth mode");
         println!("  {} {}", "set".bright_green(), "verbose               Enable verbose output");
@@ -165,6 +172,8 @@ impl InteractiveSession {
         println!("  {} {}", "set".bright_green(), "enumerate-all <types> Enumerate plugins/themes from complete database files");
         println!("  {} {}", "set".bright_green(), "                      Types: plugins, themes, or plugins,themes");
         println!();
+        println!("  {} {}", "unset".bright_yellow(), "target               Clear single target");
+        println!("  {} {}", "unset".bright_yellow(), "url-list             Clear URL list file");
         println!("  {} {}", "unset".bright_yellow(), "waf-bypass            Disable WAF bypass");
         println!("  {} {}", "unset".bright_yellow(), "stealth               Disable stealth mode");
         println!("  {} {}", "unset".bright_yellow(), "verbose              Disable verbose output");
@@ -173,10 +182,11 @@ impl InteractiveSession {
         println!("  {} {}", "unset".bright_yellow(), "enumerate-all        Disable enumeration from complete files");
         println!();
         println!("  {} {}", "show".bright_blue(), "options               Show current options");
-        println!("  {} {}", "show".bright_blue(), "target                Show current target");
+        println!("  {} {}", "show".bright_blue(), "target                Show current target / url-list");
         println!();
         println!("  {} {}", "scan".bright_magenta(), "                      Run WordPress security scan");
         println!("  {} {}", "exploit".bright_magenta(), " <template>          Execute exploit template");
+        println!("  {} {}", "exploit".bright_magenta(), " -d <dir>            Run all exploit templates in dir");
         println!("  {} {}", "vuln".bright_magenta(), " <template>           Run single vulnerability validation");
         println!("  {} {}", "vuln".bright_magenta(), " -d <dir>             Run mass vulnerability validation");
         println!("  {} {}", "bruteforce".bright_magenta(), " <users> <passwords>  Run password bruteforcing");
@@ -186,6 +196,10 @@ impl InteractiveSession {
         println!("  {} {}", "clear".bright_white(), "                      Clear screen");
         println!("  {} {}", "help".bright_white(), "                      Show this help message");
         println!("  {} {}", "exit".bright_white(), "                      Exit interactive mode");
+        println!();
+        println!("{}", "Note: with url-list set, scan/vuln/exploit print compact lines:".bright_black());
+        println!("{}", "  1/30 [template-id] https://target - vulnerable".bright_black());
+        println!("{}", "  (vuln -d <dir> counts each template×URL as one job)".bright_black());
         println!();
     }
 
@@ -201,8 +215,24 @@ impl InteractiveSession {
                     println!("Usage: set target <url>");
                     return Ok(());
                 }
+                self.url_list = None;
                 self.target = Some(args[1].to_string());
                 println!("{} Target set to: {}", "✓".bright_green(), args[1].bright_cyan());
+            }
+            "url-list" | "url_list" | "targets-list" | "targets_list" => {
+                if args.len() < 2 {
+                    println!("Usage: set url-list <file>");
+                    return Ok(());
+                }
+                // Validate file early
+                let _ = crate::targets::load_url_list(args[1])?;
+                self.target = None;
+                self.url_list = Some(args[1].to_string());
+                println!(
+                    "{} URL list set to: {}",
+                    "✓".bright_green(),
+                    args[1].bright_cyan()
+                );
             }
             "waf-bypass" => {
                 self.waf_bypass = true;
@@ -313,6 +343,14 @@ impl InteractiveSession {
         }
 
         match args[0] {
+            "target" => {
+                self.target = None;
+                println!("{} Target cleared", "✓".bright_green());
+            }
+            "url-list" | "url_list" | "targets-list" | "targets_list" => {
+                self.url_list = None;
+                println!("{} URL list cleared", "✓".bright_green());
+            }
             "waf-bypass" => {
                 self.waf_bypass = false;
                 println!("{} WAF bypass disabled", "✓".bright_green());
@@ -355,8 +393,22 @@ impl InteractiveSession {
             "options" => {
                 println!();
                 println!("{}", "Current Options:".bright_cyan().bold());
-                println!("  Target:     {}", 
-                    self.target.as_ref().map(|t| t.as_str()).unwrap_or("not set").bright_cyan());
+                println!(
+                    "  Target:     {}",
+                    self.target
+                        .as_ref()
+                        .map(|t| t.as_str())
+                        .unwrap_or("not set")
+                        .bright_cyan()
+                );
+                println!(
+                    "  URL list:   {}",
+                    self.url_list
+                        .as_ref()
+                        .map(|t| t.as_str())
+                        .unwrap_or("not set")
+                        .bright_cyan()
+                );
                 println!("  WAF Bypass: {}", if self.waf_bypass { "enabled".bright_green() } else { "disabled".bright_red() });
                 println!("  Stealth:    {}", if self.stealth { "enabled".bright_green() } else { "disabled".bright_red() });
                 println!("  Verbose:    {}", if self.verbose { "enabled".bright_green() } else { "disabled".bright_red() });
@@ -376,10 +428,15 @@ impl InteractiveSession {
                 println!();
             }
             "target" => {
-                if let Some(target) = &self.target {
+                if let Some(ref list) = self.url_list {
+                    println!("URL list: {}", list.bright_cyan());
+                } else if let Some(target) = &self.target {
                     println!("Target: {}", target.bright_cyan());
                 } else {
-                    println!("{} Target not set. Use 'set target <url>' to set it.", "Error:".bright_red());
+                    println!(
+                        "{} Set 'set target <url>' or 'set url-list <file>' first.",
+                        "Error:".bright_red()
+                    );
                 }
             }
             _ => {
@@ -390,75 +447,31 @@ impl InteractiveSession {
         Ok(())
     }
 
-    fn ensure_target(&self) -> Result<String> {
-        self.target
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Target not set. Use 'set target <url>' first."))
+    fn ensure_targets(&self) -> Result<Vec<String>> {
+        crate::targets::resolve_targets(self.target.as_deref(), self.url_list.as_deref())
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "No target set. Use 'set target <url>' or 'set url-list <file>' first."
+                )
+            })
     }
 
-    fn handle_scan(&mut self, _args: &[&str]) -> Result<()> {
-        let url = self.ensure_target()?;
-        println!("{} Running scan on {}...", "→".bright_blue(), url.bright_cyan());
-        
-        // Validate that both --enumerate and --enumerate-all are not used simultaneously
-        if self.enumerate.is_some() && self.enumerate_all.is_some() {
-            eprintln!("{} Cannot use enumerate and enumerate-all simultaneously", "Error:".bright_red());
-            return Err(anyhow::anyhow!("Cannot use enumerate and enumerate-all simultaneously"));
+    fn ensure_single_target(&self) -> Result<String> {
+        if self.url_list.is_some() {
+            anyhow::bail!(
+                "bruteforce/spray require a single target. Unset url-list and use 'set target <url>'."
+            );
         }
-        
-        let client = crate::http_client::HttpClient::new(url.clone(), self.waf_bypass, self.stealth)?;
-        let use_realtime_output = !self.verbose && self.output == "table";
-        let results = crate::scanner::Scanner::scan(&client, self.verbose, use_realtime_output, self.force, self.stealth, self.enumerate.clone(), self.enumerate_all.clone())?;
-        // Only print final output for json/markdown, or if real-time wasn't used
-        if !use_realtime_output {
-            let output = crate::output::OutputFormatter::format(&results, &self.output, self.verbose);
-            println!("{}", output);
-        }
-        
-        Ok(())
-    }
-
-    fn handle_exploit(&mut self, args: &[&str]) -> Result<()> {
-        if args.is_empty() {
-            println!("Usage: exploit <template_path>");
-            return Ok(());
-        }
-
-        let url = self.ensure_target()?;
-        let template = args[0];
-        println!("{} Executing exploit template: {} on {}...", 
-            "→".bright_blue(), template.bright_cyan(), url.bright_cyan());
-
-        let client = crate::http_client::HttpClient::new(url.clone(), self.waf_bypass, self.stealth)?;
-        let exploit_template = crate::exploits::ExploitEngine::load_template(template)?;
-        let result = crate::exploits::ExploitEngine::execute(&exploit_template, &client)?;
-
-        let scan_results = crate::models::ScanResults {
-            target: url.clone(),
-            tech_stack: None,
-            robots_txt: None,
-            wordpress: None,
-            wordpress_config: None,
-            plugins: vec![],
-            themes: vec![],
-            vulnerabilities: vec![],
-            vuln_validations: vec![],
-            exploit_results: vec![result],
-            usernames: vec![],
-            file_disclosures: vec![],
-            bruteforce_results: None,
-        };
-
-        let output = crate::output::OutputFormatter::format(&scan_results, &self.output, self.verbose);
-        println!("{}", output);
-
-        Ok(())
+        self.target.clone().ok_or_else(|| {
+            anyhow::anyhow!("Target not set. Use 'set target <url>' first.")
+        })
     }
 
     fn handle_vuln(&mut self, args: &[&str]) -> Result<()> {
-        let url = self.ensure_target()?;
+        let targets = self.ensure_targets()?;
+        let multi = targets.len() > 1 || self.url_list.is_some();
+        let total = targets.len();
 
-        // Parse arguments
         let mut template: Option<String> = None;
         let mut template_dir: Option<String> = None;
 
@@ -482,7 +495,6 @@ impl InteractiveSession {
                     }
                 }
                 _ => {
-                    // Assume it's a template path if no flag
                     if template.is_none() && template_dir.is_none() {
                         template = Some(args[i].to_string());
                     }
@@ -495,88 +507,325 @@ impl InteractiveSession {
             println!("Usage: vuln <template_path> OR vuln -d <template_directory>");
             return Ok(());
         }
+        if template.is_some() && template_dir.is_some() {
+            return Err(anyhow::anyhow!(
+                "Provide either a template file or -d <template-dir>, not both"
+            ));
+        }
 
-        let client = crate::http_client::HttpClient::new(url.clone(), self.waf_bypass, self.stealth)?;
-        let mut results = vec![];
-
-        if let Some(template_path) = template {
-            println!("{} Running vulnerability validation: {} on {}...", 
-                "→".bright_blue(), template_path.bright_cyan(), url.bright_cyan());
-            let vuln_template = crate::vulns::VulnEngine::load_template(&template_path)?;
-            let result = crate::vulns::VulnEngine::execute(&vuln_template, &client)?;
-            results.push(result);
+        let templates = if let Some(template_path) = template {
+            if !multi {
+                println!(
+                    "{} Running vulnerability validation: {}...",
+                    "→".bright_blue(),
+                    template_path.bright_cyan()
+                );
+            }
+            vec![crate::vulns::VulnEngine::load_template(&template_path)?]
         } else if let Some(dir) = template_dir {
-            println!("{} Running mass vulnerability validation from {} on {}...", 
-                "→".bright_blue(), dir.bright_cyan(), url.bright_cyan());
-            let templates = crate::vulns::VulnEngine::load_templates_from_dir(&dir)?;
-            let num_threads = self.threads.max(1).min(templates.len());
+            if !multi {
+                println!(
+                    "{} Running mass vulnerability validation from {}...",
+                    "→".bright_blue(),
+                    dir.bright_cyan()
+                );
+            }
+            crate::vulns::VulnEngine::load_templates_from_dir(&dir)?
+        } else {
+            vec![]
+        };
 
-            if num_threads == 1 {
-                for template in templates {
-                    match crate::vulns::VulnEngine::execute(&template, &client) {
-                        Ok(result) => results.push(result),
-                        Err(e) => eprintln!("Error executing template {}: {}", template.id, e),
+        let total_jobs = total.saturating_mul(templates.len().max(1));
+        let mut job = 0usize;
+
+        for url in targets.iter() {
+            let client =
+                crate::http_client::HttpClient::new(url.clone(), self.waf_bypass, self.stealth)?;
+
+            if multi {
+                for tmpl in &templates {
+                    job += 1;
+                    match crate::vulns::VulnEngine::execute(tmpl, &client) {
+                        Ok(result) => {
+                            crate::output::OutputFormatter::print_url_list_result(
+                                job,
+                                total_jobs,
+                                &result.template_id,
+                                url,
+                                result.matched,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "{} [{}/{}] [{}] {} - error: {}",
+                                "!".bright_red(),
+                                job,
+                                total_jobs,
+                                tmpl.id,
+                                url,
+                                e
+                            );
+                        }
                     }
                 }
             } else {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let client_arc = std::sync::Arc::new(client);
-                let templates_arc: Vec<_> = templates.into_iter().map(std::sync::Arc::new).collect();
+                // Single target: threaded mass validation when template-dir + threads > 1
+                let mut results = vec![];
+                if templates.len() == 1 || self.threads <= 1 {
+                    for tmpl in &templates {
+                        match crate::vulns::VulnEngine::execute(tmpl, &client) {
+                            Ok(result) => results.push(result),
+                            Err(e) => eprintln!("Error executing template {}: {}", tmpl.id, e),
+                        }
+                    }
+                } else {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let client_arc = std::sync::Arc::new(client);
+                    let templates_arc: Vec<_> =
+                        templates.iter().cloned().map(std::sync::Arc::new).collect();
+                    let num_threads = self.threads.max(1).min(templates_arc.len());
+                    let chunk_size = templates_arc.len().div_ceil(num_threads);
+                    let mut handles = vec![];
 
-                let chunk_size = (templates_arc.len() + num_threads - 1) / num_threads;
-                let mut handles = vec![];
+                    for chunk in templates_arc.chunks(chunk_size) {
+                        let chunk = chunk.to_vec();
+                        let client_clone = std::sync::Arc::clone(&client_arc);
+                        let tx_clone = tx.clone();
 
-                for chunk in templates_arc.chunks(chunk_size) {
-                    let chunk = chunk.to_vec();
-                    let client_clone = std::sync::Arc::clone(&client_arc);
-                    let tx_clone = tx.clone();
-
-                    let handle = std::thread::spawn(move || {
-                        for template in chunk {
-                            match crate::vulns::VulnEngine::execute(&template, &client_clone) {
-                                Ok(result) => {
-                                    let _ = tx_clone.send(result);
-                                }
-                                Err(e) => {
-                                    eprintln!("Error executing template {}: {}", template.id, e);
+                        let handle = std::thread::spawn(move || {
+                            for template in chunk {
+                                match crate::vulns::VulnEngine::execute(&template, &client_clone) {
+                                    Ok(result) => {
+                                        let _ = tx_clone.send(result);
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Error executing template {}: {}",
+                                            template.id, e
+                                        );
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                        handles.push(handle);
+                    }
 
-                    handles.push(handle);
+                    drop(tx);
+                    for handle in handles {
+                        handle.join().unwrap();
+                    }
+                    while let Ok(result) = rx.recv() {
+                        results.push(result);
+                    }
                 }
 
-                drop(tx);
+                let mut scan_results = crate::models::ScanResults::for_target(url.clone());
+                scan_results.vuln_validations = results;
+                let output = crate::output::OutputFormatter::format(
+                    &scan_results,
+                    &self.output,
+                    self.verbose,
+                );
+                println!("{}", output);
+            }
+        }
 
-                for handle in handles {
-                    handle.join().unwrap();
+        Ok(())
+    }
+
+    fn handle_scan(&mut self, _args: &[&str]) -> Result<()> {
+        let targets = self.ensure_targets()?;
+        let multi = targets.len() > 1 || self.url_list.is_some();
+        let total = targets.len();
+
+        if self.enumerate.is_some() && self.enumerate_all.is_some() {
+            eprintln!(
+                "{} Cannot use enumerate and enumerate-all simultaneously",
+                "Error:".bright_red()
+            );
+            return Err(anyhow::anyhow!(
+                "Cannot use enumerate and enumerate-all simultaneously"
+            ));
+        }
+
+        for (idx, url) in targets.iter().enumerate() {
+            if !multi {
+                println!(
+                    "{} Running scan on {}...",
+                    "→".bright_blue(),
+                    url.bright_cyan()
+                );
+            }
+
+            let client =
+                crate::http_client::HttpClient::new(url.clone(), self.waf_bypass, self.stealth)?;
+            let use_realtime_output = !multi && !self.verbose && self.output == "table";
+            match crate::scanner::Scanner::scan(
+                &client,
+                self.verbose,
+                use_realtime_output,
+                self.force,
+                self.stealth,
+                self.enumerate.clone(),
+                self.enumerate_all.clone(),
+            ) {
+                Ok(results) => {
+                    if multi {
+                        crate::output::OutputFormatter::print_url_list_result(
+                            idx + 1,
+                            total,
+                            "scan",
+                            url,
+                            !results.vulnerabilities.is_empty(),
+                        );
+                    } else if !use_realtime_output {
+                        let output = crate::output::OutputFormatter::format(
+                            &results,
+                            &self.output,
+                            self.verbose,
+                        );
+                        println!("{}", output);
+                    }
                 }
-
-                while let Ok(result) = rx.recv() {
-                    results.push(result);
+                Err(e) => {
+                    if multi {
+                        eprintln!(
+                            "{} [{}/{}] [scan] {} - error: {}",
+                            "!".bright_red(),
+                            idx + 1,
+                            total,
+                            url,
+                            e
+                        );
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
         }
 
-        let scan_results = crate::models::ScanResults {
-            target: url.clone(),
-            tech_stack: None,
-            robots_txt: None,
-            wordpress: None,
-            wordpress_config: None,
-            plugins: vec![],
-            themes: vec![],
-            vulnerabilities: vec![],
-            vuln_validations: results,
-            exploit_results: vec![],
-            usernames: vec![],
-            file_disclosures: vec![],
-            bruteforce_results: None,
+        Ok(())
+    }
+
+    fn handle_exploit(&mut self, args: &[&str]) -> Result<()> {
+        let targets = self.ensure_targets()?;
+        let multi = targets.len() > 1 || self.url_list.is_some();
+        let total = targets.len();
+
+        let mut template: Option<String> = None;
+        let mut template_dir: Option<String> = None;
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i] {
+                "-t" | "--template" => {
+                    if i + 1 < args.len() {
+                        template = Some(args[i + 1].to_string());
+                        i += 2;
+                    } else {
+                        return Err(anyhow::anyhow!("--template requires a path"));
+                    }
+                }
+                "-d" | "--template-dir" | "--dir" => {
+                    if i + 1 < args.len() {
+                        template_dir = Some(args[i + 1].to_string());
+                        i += 2;
+                    } else {
+                        return Err(anyhow::anyhow!("--template-dir requires a path"));
+                    }
+                }
+                _ => {
+                    if template.is_none() && template_dir.is_none() {
+                        template = Some(args[i].to_string());
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        if template.is_none() && template_dir.is_none() {
+            println!("Usage: exploit <template_path> OR exploit -d <template_directory>");
+            return Ok(());
+        }
+        if template.is_some() && template_dir.is_some() {
+            return Err(anyhow::anyhow!(
+                "Provide either a template file or -d <template-dir>, not both"
+            ));
+        }
+
+        let templates = if let Some(template_path) = template {
+            if !multi {
+                println!(
+                    "{} Executing exploit template: {}...",
+                    "→".bright_blue(),
+                    template_path.bright_cyan()
+                );
+            }
+            vec![crate::exploits::ExploitEngine::load_template(&template_path)?]
+        } else if let Some(dir) = template_dir {
+            if !multi {
+                println!(
+                    "{} Executing exploit templates from {}...",
+                    "→".bright_blue(),
+                    dir.bright_cyan()
+                );
+            }
+            crate::exploits::ExploitEngine::load_templates_from_dir(&dir)?
+        } else {
+            vec![]
         };
 
-        let output = crate::output::OutputFormatter::format(&scan_results, &self.output, self.verbose);
-        println!("{}", output);
+        let total_jobs = total.saturating_mul(templates.len().max(1));
+        let mut job = 0usize;
+
+        for url in targets.iter() {
+            let client =
+                crate::http_client::HttpClient::new(url.clone(), self.waf_bypass, self.stealth)?;
+
+            if multi {
+                for tmpl in &templates {
+                    job += 1;
+                    match crate::exploits::ExploitEngine::execute(tmpl, &client) {
+                        Ok(result) => {
+                            crate::output::OutputFormatter::print_url_list_result(
+                                job,
+                                total_jobs,
+                                &result.template_id,
+                                url,
+                                result.success,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "{} [{}/{}] [{}] {} - error: {}",
+                                "!".bright_red(),
+                                job,
+                                total_jobs,
+                                tmpl.id,
+                                url,
+                                e
+                            );
+                        }
+                    }
+                }
+            } else {
+                let mut results = vec![];
+                for tmpl in &templates {
+                    match crate::exploits::ExploitEngine::execute(tmpl, &client) {
+                        Ok(result) => results.push(result),
+                        Err(e) => eprintln!("Error executing template {}: {}", tmpl.id, e),
+                    }
+                }
+                let mut scan_results = crate::models::ScanResults::for_target(url.clone());
+                scan_results.exploit_results = results;
+                let output = crate::output::OutputFormatter::format(
+                    &scan_results,
+                    &self.output,
+                    self.verbose,
+                );
+                println!("{}", output);
+            }
+        }
 
         Ok(())
     }
@@ -587,7 +836,7 @@ impl InteractiveSession {
             return Ok(());
         }
 
-        let url = self.ensure_target()?;
+        let url = self.ensure_single_target()?;
         let users = args[0].to_string();
         let passwords = args[1].to_string();
 
@@ -664,7 +913,7 @@ impl InteractiveSession {
             return Ok(());
         }
 
-        let url = self.ensure_target()?;
+        let url = self.ensure_single_target()?;
         let users = args[0].to_string();
         let passwords = args[1].to_string();
 

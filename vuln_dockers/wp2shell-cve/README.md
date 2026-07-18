@@ -59,6 +59,8 @@ Edit `.env` to change port, image pin, or credentials. Defaults:
 - `wp-setup` enables `/%postname%/` permalinks **and writes Apache rewrite rules** into `.htaccess` so `/wp-json/batch/v1` works.
 - If `/wp-json/` still 404s, use the `wp2shell-cve-2026-63030-rest-route.json` template, or re-run setup: `docker compose run --rm wp-setup`.
 - No security plugins / WAF — stock install so the batch probe can succeed.
+- The published vuln templates use the **3-request** marker (`///` + posts + block-renderer). Some CDNs (e.g. Hostinger) block the older 4-request form that nests `/batch/v1` in the body; the 3-request form still yields the same three marker codes on affected cores.
+- The UNION SQLi exploit template still needs the nested `/batch/v1` trailer (Icex0/Searchlight shape). Edge WAFs may block that while the marker still matches — treat “vuln MATCH + exploit fail” as possible WAF mitigation, not a false positive on the marker.
 - To compare a **patched** build, change `WORDPRESS_IMAGE` to `wordpress:7.0.2-apache` (when published on Docker Hub), run `docker compose down -v && docker compose up -d`, and expect the marker template **not** to match.
 
 ## References

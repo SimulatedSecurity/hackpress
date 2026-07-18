@@ -38,17 +38,32 @@ Examples:
   # Basic scan
   hackpress scan https://example.com
 
+  # Scan a list of targets (one URL per line)
+  hackpress scan --url-list targets.txt
+
   # Scan with verbose output and WAF bypass
   hackpress scan https://example.com --verbose --waf-bypass
 
   # Run single vulnerability validation template
   hackpress vuln https://example.com --template templates/vulns/example-xss.json
 
-  # Mass vulnerability validation
+  # Validate a template against many targets
+  hackpress vuln --url-list targets.txt --template templates/vulns/wp2shell-cve-2026-63030.json
+
+  # Mass vulnerability validation (many templates, one host)
   hackpress vuln https://example.com --template-dir templates/vulns/ --threads 20
+
+  # All templates against many hosts
+  hackpress vuln --url-list targets.txt --template-dir templates/vulns/
 
   # Execute exploit template
   hackpress exploit https://example.com --template templates/exploits/example-rce.json
+
+  # All exploit templates against one host
+  hackpress exploit https://example.com --template-dir templates/exploits/
+
+  # Exploit against a URL list
+  hackpress exploit --url-list targets.txt --template templates/exploits/example-rce.json
 
   # Password bruteforcing
   hackpress bruteforce https://example.com --users users.txt --passwords passwords.txt
@@ -99,8 +114,12 @@ pub struct Cli {
 pub enum Commands {
     /// Main scanning command
     Scan {
-        /// Target URL to scan
-        url: String,
+        /// Target URL (omit when using --url-list)
+        #[arg(required_unless_present = "url_list")]
+        url: Option<String>,
+        /// File with one target URL per line (# comments and blank lines ignored)
+        #[arg(long = "url-list", value_name = "FILE", conflicts_with = "url")]
+        url_list: Option<String>,
         /// Enumerate plugins/themes from top database files (plugins-top.txt, themes-top.txt)
         /// Format: --enumerate=plugins,themes or --enumerate=plugins or --enumerate=themes
         #[arg(long, value_delimiter = ',')]
@@ -111,23 +130,35 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         enumerate_all: Option<Vec<String>>,
     },
-    /// Run specific exploit template
+    /// Run specific exploit template(s)
+    #[command(visible_alias = "exploits")]
     Exploit {
-        /// Target URL
-        url: String,
-        /// Path to exploit template (required)
-        #[arg(short, long)]
-        template: String,
+        /// Target URL (omit when using --url-list)
+        #[arg(required_unless_present = "url_list")]
+        url: Option<String>,
+        /// File with one target URL per line (# comments and blank lines ignored)
+        #[arg(long = "url-list", value_name = "FILE", conflicts_with = "url")]
+        url_list: Option<String>,
+        /// Path to single exploit template file
+        #[arg(short, long, conflicts_with = "template_dir")]
+        template: Option<String>,
+        /// Directory of .json exploit templates (runs all; works with one URL or --url-list)
+        #[arg(long, conflicts_with = "template")]
+        template_dir: Option<String>,
     },
     /// Run vulnerability validation template(s)
     Vuln {
-        /// Target URL
-        url: String,
+        /// Target URL (omit when using --url-list)
+        #[arg(required_unless_present = "url_list")]
+        url: Option<String>,
+        /// File with one target URL per line (# comments and blank lines ignored)
+        #[arg(long = "url-list", value_name = "FILE", conflicts_with = "url")]
+        url_list: Option<String>,
         /// Path to single vulnerability validation template file
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "template_dir")]
         template: Option<String>,
-        /// Directory containing vulnerability validation templates (mass execution)
-        #[arg(long)]
+        /// Directory of .json vuln templates (runs all; works with one URL or --url-list)
+        #[arg(long, conflicts_with = "template")]
         template_dir: Option<String>,
     },
     /// Password bruteforcing attack
@@ -172,4 +203,3 @@ pub enum Commands {
     /// Start interactive console mode
     Interactive,
 }
-
